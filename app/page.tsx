@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState, type CSSProperties } from "react";
 import PortMap3D, { type MapCommand } from "./components/PortMap3D";
+import TeamProfiles from "./components/TeamProfiles";
 import {
   ACTIONS,
   EMPTY_ACTIONS,
@@ -1094,6 +1095,7 @@ export default function Page() {
               </div>
               <footer className="content-footer">
                 <span>HARBORMIND · DIGITAL TWIN PROTOTYPE</span>
+                <TeamProfiles compact />
                 <span>
                   Illustrative data only · Not for operational navigation
                 </span>
@@ -2084,6 +2086,7 @@ export default function Page() {
               )}
               <footer className="content-footer">
                 <span>HARBORMIND · WHAT-IF SANDBOX</span>
+                <TeamProfiles compact />
                 <span>
                   {run
                     ? `Decision source: ${decisionSource} · simulation results, not validated forecasts`
@@ -2276,6 +2279,13 @@ export default function Page() {
                   </div>
                 </div>
               </div>
+              <section
+                className="panel team-panel"
+                aria-labelledby="team-heading"
+              >
+                <div className="panel-kicker">THE TEAM</div>
+                <TeamProfiles />
+              </section>
               <div className="about-footer-note">
                 <Icon name="shield" size={16} /> Port and cargo inputs are
                 synthetic. Scenario recommendations identify Jev, local mock, or
@@ -2284,6 +2294,7 @@ export default function Page() {
               </div>
               <footer className="content-footer">
                 <span>HARBORMIND · RESILIENCE BY DESIGN</span>
+                <TeamProfiles compact />
                 <span>Keep what matters moving.</span>
               </footer>
             </main>
