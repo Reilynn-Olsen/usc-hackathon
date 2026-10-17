@@ -7,9 +7,10 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "test:api": "node --experimental-strip-types --test-reporter=spec tests/api-routes.test.mjs"
+    "test:api": "node --experimental-strip-types --test --test-reporter=spec tests/*.test.mjs"
   },
   "dependencies": {
+    "@typesafe-ai/sdk": "^0.7.0",
     "next": "16.4.2",
     "react": "19.3.0",
     "react-dom": "19.3.0"
