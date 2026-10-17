@@ -123,12 +123,14 @@ const hasCriticalCargo = (ship: SimulationState["ships"][number]) => ship.cargo.
 
 export const callJev: JevCall = async (state, strategies, outcomes, criteria, targetPercent, selectableIds) => {
   if (!process.env.TYPESAFE_API_KEY) throw new Error("TYPESAFE_API_KEY is not configured.");
-  const available = Object.fromEntries(strategies.filter((strategy) => selectableIds.includes(strategy.id)).map((strategy) => [strategy.id, strategy.name + ": " + strategy.summary]));
+  const orderedStrategies = [...strategies].sort((left, right) => left.id.localeCompare(right.id));
+  const orderedSelectableIds = [...selectableIds].sort();
+  const available = Object.fromEntries(orderedStrategies.filter((strategy) => orderedSelectableIds.includes(strategy.id)).map((strategy) => [strategy.id, strategy.name + ": " + strategy.summary]));
   const client = new TypeSafeClient({ logLevel: "error", timeout: 10_000, retry: { maxRetries: 0 } });
   const response = await client.systemOne({
-    state: JSON.parse(JSON.stringify(modelSummary(state, strategies, outcomes, criteria, targetPercent, selectableIds))) as Record<string, JsonValue>,
+    state: JSON.parse(JSON.stringify(modelSummary(state, orderedStrategies, outcomes, criteria, targetPercent, orderedSelectableIds))) as Record<string, JsonValue>,
     questions: {
-      selection: choice(`Select the feasible recovery strategy best matched to the operator objective "${criteria.objective}". Use the supplied simulated outcomes and choose only an ID listed in selectableStrategyIds; candidates marked selectionEligible=false are not selectable. Respect the critical-delivery target of ${targetPercent}%${criteria.maximumDisruptionCost === undefined ? "" : ` and the disruption-cost limit of $${criteria.maximumDisruptionCost}`}. A cost objective should prefer the cheaper plan when it satisfies the delivery target.`, available),
+      selection: choice(`Select the feasible recovery strategy best matched to the operator objective "${criteria.objective}". The list order carries no preference; compare the simulated outcomes. Choose only an ID listed in selectableStrategyIds; candidates marked selectionEligible=false are not selectable. Respect the critical-delivery target of ${targetPercent}%${criteria.maximumDisruptionCost === undefined ? "" : ` and the disruption-cost limit of $${criteria.maximumDisruptionCost}`}. A cost objective should prefer the cheaper plan when it satisfies the delivery target.`, available),
       cargoUrgency: score("Score cargo urgency from 0 to 3 using the ordered rubric. Consider essential classification, explicit deadlines, and estimated consequences of delay.", CARGO_URGENCY_RUBRIC),
       operationalRisk: score("Score operational risk from 0 to 3 using the ordered rubric. Consider capacity constraints, weather, active disruptions, and simulated outcome likelihoods.", OPERATIONAL_RISK_RUBRIC),
       humanReview: noul("Should a human port operator review this recommendation before any operational decision is approved?"),
