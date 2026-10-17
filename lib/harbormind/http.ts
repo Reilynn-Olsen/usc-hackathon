@@ -1,5 +1,19 @@
-import type { SimulationOptions, SimulationState } from "./types.ts";
+import type { DecisionCriteria, OptimizationObjective, SimulationOptions, SimulationState } from "./types.ts";
 import { validateSimulationState } from "./validate.ts";
+
+const objectives = new Set<OptimizationObjective>(["critical-delivery", "minimize-delay", "minimize-cost", "balanced"]);
+
+export function readDecisionCriteria(value: unknown, fallback: DecisionCriteria = { objective: "balanced" }): { criteria?: DecisionCriteria; error?: string } {
+  if (value === undefined) return { criteria: fallback };
+  if (!value || typeof value !== "object" || Array.isArray(value)) return { error: "decision must be an object." };
+  const decision = value as Record<string, unknown>;
+  if (Object.keys(decision).some((key) => !["objective", "maximumDisruptionCost"].includes(key))
+    || typeof decision.objective !== "string" || !objectives.has(decision.objective as OptimizationObjective)
+    || (decision.maximumDisruptionCost !== undefined && (typeof decision.maximumDisruptionCost !== "number" || !Number.isFinite(decision.maximumDisruptionCost) || decision.maximumDisruptionCost < 0))) {
+    return { error: "decision must contain a supported objective and an optional nonnegative maximumDisruptionCost." };
+  }
+  return { criteria: { objective: decision.objective as OptimizationObjective, ...(typeof decision.maximumDisruptionCost === "number" ? { maximumDisruptionCost: decision.maximumDisruptionCost } : {}) } };
+}
 
 export interface HarnessRequest {
   state: SimulationState;

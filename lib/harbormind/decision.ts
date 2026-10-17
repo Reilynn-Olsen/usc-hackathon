@@ -1,6 +1,6 @@
 import { choice, noul, score, TypeSafeClient } from "@typesafe-ai/sdk";
 import type { JsonValue } from "@typesafe-ai/sdk";
-import type { DecisionCriteria, JevAssessment, RecoveryStrategy, SimulationOptions, SimulationState, SimulationSummary, Recommendation } from "./types.ts";
+import type { DecisionCriteria, JevAssessment, RecoveryPlan, RecoveryStrategy, SimulationOptions, SimulationState, SimulationSummary, Recommendation } from "./types.ts";
 import { assertSimulationBudget, DEFAULT_SIMULATION_OPTIONS, generateStrategies, simulateStrategy } from "./simulation.ts";
 
 const CARGO_URGENCY_RUBRIC = [
@@ -15,6 +15,21 @@ const OPERATIONAL_RISK_RUBRIC = [
   "High: 40% to 59% of normal capacity, severe weather, or essential cargo at risk from the modeled queue.",
   "Severe: below 40% of normal capacity, no modeled unloading capacity, or low simulated odds of meeting the critical-cargo target.",
 ] as const;
+const round = (value: number) => Math.round(value * 100) / 100;
+
+function recoveryPlan(strategy: RecoveryStrategy): RecoveryPlan {
+  return {
+    scheduling: strategy.scheduling,
+    stagingWindowsByVessel: strategy.stagingWindowsByVessel,
+    cargoPrioritiesByBatch: strategy.cargoPrioritiesByBatch,
+    reserveBerthForCriticalCargo: strategy.reserveBerthForCriticalCargo,
+    criticalCapacityReservation: strategy.criticalCapacityReservation,
+    assignments: strategy.assignments,
+    objective: strategy.objective,
+    minimumCriticalCargoOnTimePercent: strategy.minimumCriticalCargoOnTimePercent,
+    maximumDisruptionCost: strategy.maximumDisruptionCost,
+  };
+}
 
 export type JevReply = {
   model: string;
@@ -26,6 +41,59 @@ export type JevReply = {
 };
 
 export type JevCall = (state: SimulationState, strategies: RecoveryStrategy[], outcomes: Map<string, SimulationSummary>, criteria: DecisionCriteria, targetPercent: number, selectableIds: string[]) => Promise<JevReply>;
+export type StrategyOutcomeEvaluator = (strategies: RecoveryStrategy[]) => Map<string, SimulationSummary>;
+
+export function assessAdaptivePlanQuality(
+  proposed: SimulationSummary,
+  continuation: SimulationSummary,
+  criteria: DecisionCriteria,
+  targetPercent: number,
+): { applyProposed: boolean; status: "accepted" | "rejected-constraints" | "rejected-dominated" | "equivalent"; explanation: string } {
+  const a = proposed.mean;
+  const b = continuation.mean;
+  const violatesTarget = a.criticalCargoOnTimePercent < targetPercent;
+  const violatesCost = criteria.maximumDisruptionCost !== undefined
+    && (a.estimatedDisruptionCost === null || a.estimatedDisruptionCost > criteria.maximumDisruptionCost);
+  if (violatesTarget || violatesCost) {
+    const constraints = [violatesTarget && `the ${targetPercent}% critical-delivery target`, violatesCost && `the $${criteria.maximumDisruptionCost} cost ceiling`].filter(Boolean).join(" and ");
+    const continuationMeets = b.criticalCargoOnTimePercent >= targetPercent
+      && (criteria.maximumDisruptionCost === undefined || b.estimatedDisruptionCost !== null && b.estimatedDisruptionCost <= criteria.maximumDisruptionCost);
+    return {
+      applyProposed: false,
+      status: "rejected-constraints",
+      explanation: `Rejected Jev's plan because it violates ${constraints}; ${continuationMeets ? "the current plan meets the mandatory constraints, so it continues" : "the current plan continues because no compliant alternative was established"}.`,
+    };
+  }
+
+  const costComparable = a.estimatedDisruptionCost !== null && b.estimatedDisruptionCost !== null;
+  const costNoWorse = costComparable && b.estimatedDisruptionCost! <= a.estimatedDisruptionCost! + 0.01;
+  const noWorse = b.criticalCargoOnTimePercent >= a.criticalCargoOnTimePercent - 0.01
+    && b.averageCargoDelayHours <= a.averageCargoDelayHours + 0.01
+    && b.totalContainersProcessed >= a.totalContainersProcessed - 0.01
+    && b.delayedVessels <= a.delayedVessels
+    && continuation.probabilityOfMeetingTarget >= proposed.probabilityOfMeetingTarget - 0.01
+    && costComparable && costNoWorse;
+  const strictlyBetter = b.criticalCargoOnTimePercent > a.criticalCargoOnTimePercent + 0.01
+    || b.averageCargoDelayHours < a.averageCargoDelayHours - 0.01
+    || b.totalContainersProcessed > a.totalContainersProcessed + 0.01
+    || b.delayedVessels < a.delayedVessels
+    || continuation.probabilityOfMeetingTarget > proposed.probabilityOfMeetingTarget + 0.01
+    || costComparable && b.estimatedDisruptionCost! < a.estimatedDisruptionCost! - 0.01;
+  if (noWorse && strictlyBetter) {
+    return { applyProposed: false, status: "rejected-dominated", explanation: "Rejected Jev's plan because continuing the current plan is no worse across measured delivery, delay, vessel delays, throughput, success likelihood, and cost, and improves at least one." };
+  }
+
+  const sameCost = a.estimatedDisruptionCost === null && b.estimatedDisruptionCost === null
+    || costComparable && Math.abs(a.estimatedDisruptionCost! - b.estimatedDisruptionCost!) <= 0.01;
+  if (Math.abs(a.criticalCargoOnTimePercent - b.criticalCargoOnTimePercent) <= 0.01
+    && Math.abs(a.averageCargoDelayHours - b.averageCargoDelayHours) <= 0.01
+    && Math.abs(a.totalContainersProcessed - b.totalContainersProcessed) <= 0.01
+    && a.delayedVessels === b.delayedVessels
+    && Math.abs(proposed.probabilityOfMeetingTarget - continuation.probabilityOfMeetingTarget) <= 0.01 && sameCost) {
+    return { applyProposed: false, status: "equivalent", explanation: "The plans have equivalent measured outcomes, so the current plan continues without an unnecessary operational change." };
+  }
+  return { applyProposed: true, status: "accepted", explanation: "Accepted Jev's plan: it meets the mandatory constraints and is not strictly dominated by continuing the current plan." };
+}
 
 function reviewIndicators(state: SimulationState): string[] {
   const result: string[] = [];
@@ -50,6 +118,10 @@ function affectedShipsForStrategy(state: SimulationState, strategy: RecoveryStra
   for (const action of strategy.actions) {
     if (action.type === "delay") affected.add(action.vesselId);
     if (action.type === "reroute") affected.add(action.vesselId);
+    if (action.type === "cargo-priority") {
+      const ship = state.ships.find((item) => item.cargo.some((cargo) => cargo.cargoId === action.cargoId));
+      if (ship) affected.add(ship.vesselId);
+    }
     if (action.type === "reserve-throughput") for (const ship of state.ships) {
       if (strategy.assignments[ship.vesselId] && hasCriticalCargo(ship)) affected.add(ship.vesselId);
     }
@@ -93,6 +165,7 @@ function modelSummary(state: SimulationState, strategies: RecoveryStrategy[], ou
       const cost = outcome?.mean.estimatedDisruptionCost;
       return {
         id: strategy.id, name: strategy.name, summary: strategy.summary, operationalActions: strategy.actions,
+        plan: recoveryPlan(strategy),
         metrics: outcome?.mean ?? null,
         estimatedTargetSuccessProbability: outcome?.probabilityOfMeetingTarget ?? null,
         selectionEligible: selectableIds.includes(strategy.id),
@@ -150,12 +223,13 @@ export const callJev: JevCall = async (state, strategies, outcomes, criteria, ta
 
 function validateJevReply(reply: JevReply, strategies: RecoveryStrategy[]): JevAssessment {
   const validProbability = (value: number) => Number.isFinite(value) && value >= 0 && value <= 1;
+  const normalized = (values: number[]) => values.length > 0 && Math.abs(values.reduce((sum, value) => sum + value, 0) - 1) <= 0.01;
   const candidates = new Set(strategies.map((strategy) => strategy.id));
   if (!reply.model || typeof reply.model !== "string") throw new Error("Jev returned invalid model metadata.");
   if (!candidates.has(reply.selection.choice)) throw new Error("Jev selected an ID outside the feasible candidate set.");
   const choiceProbabilities = reply.selection.probabilities;
-  if (!validProbability(reply.selection.confidence) || Object.keys(choiceProbabilities).length !== candidates.size || !Object.entries(choiceProbabilities).every(([id, value]) => candidates.has(id) && validProbability(value))) throw new Error("Jev returned invalid strategy confidence or probabilities.");
-  const validScore = (value: JevReply["operationalRisk"]) => Number.isFinite(value.score) && value.score >= 0 && value.score <= 3 && validProbability(value.confidence) && Object.values(value.probabilities).length >= 2 && Object.values(value.probabilities).every(validProbability) && Object.values(value.legend).every((label) => typeof label === "string");
+  if (!validProbability(reply.selection.confidence) || Object.keys(choiceProbabilities).length !== candidates.size || !Object.entries(choiceProbabilities).every(([id, value]) => candidates.has(id) && validProbability(value)) || !normalized(Object.values(choiceProbabilities))) throw new Error("Jev returned invalid strategy confidence or probabilities.");
+  const validScore = (value: JevReply["operationalRisk"]) => Number.isFinite(value.score) && value.score >= 0 && value.score <= 3 && validProbability(value.confidence) && Object.values(value.probabilities).length >= 2 && Object.values(value.probabilities).every(validProbability) && normalized(Object.values(value.probabilities)) && Object.values(value.legend).every((label) => typeof label === "string");
   if (!validScore(reply.operationalRisk) || !validScore(reply.cargoUrgency)) throw new Error("Jev returned an invalid qualitative score.");
   if (!validProbability(reply.humanReview) || !validProbability(reply.timeCritical)) throw new Error("Jev returned an invalid Noul probability.");
   return {
@@ -182,11 +256,24 @@ function compareOutcomes(left: SimulationSummary, right: SimulationSummary, obje
   return success || critical || delay || cost;
 }
 
+function decisionExplanation(strategy: RecoveryStrategy, outcome: SimulationSummary, baseline: SimulationSummary, criteria: DecisionCriteria, targetPercent: number): string {
+  const metrics = outcome.mean;
+  const criticalChange = round(metrics.criticalCargoOnTimePercent - baseline.mean.criticalCargoOnTimePercent);
+  const delayChange = round(metrics.averageCargoDelayHours - baseline.mean.averageCargoDelayHours);
+  const cost = metrics.estimatedDisruptionCost === null ? "cost unavailable" : `modeled disruption cost $${round(metrics.estimatedDisruptionCost)}`;
+  const delivery = `${metrics.criticalCargoOnTimePercent.toFixed(1)}% critical cargo on time (${criticalChange >= 0 ? "+" : ""}${criticalChange.toFixed(1)} pp vs baseline)`;
+  const delay = `${metrics.averageCargoDelayHours.toFixed(1)}h average container delay (${delayChange >= 0 ? "+" : ""}${delayChange.toFixed(1)}h vs baseline)`;
+  const objective = criteria.objective === "critical-delivery" ? "critical cargo delivery" : criteria.objective === "minimize-delay" ? "average container delay" : criteria.objective === "minimize-cost" ? "modeled disruption cost" : "balanced recovery";
+  const constraint = metrics.criticalCargoOnTimePercent >= targetPercent ? `meets the ${targetPercent}% critical-delivery target` : `misses the ${targetPercent}% critical-delivery target`;
+  const costConstraint = criteria.maximumDisruptionCost === undefined ? "" : metrics.estimatedDisruptionCost === null ? "; cost ceiling cannot be checked" : metrics.estimatedDisruptionCost <= criteria.maximumDisruptionCost ? ` and stays within the $${criteria.maximumDisruptionCost} cost ceiling` : ` and exceeds the $${criteria.maximumDisruptionCost} cost ceiling`;
+  return `Selected for ${objective}. Simulation outcome: ${delivery}, ${delay}, and ${cost}; it ${constraint}${costConstraint}. ${strategy.actions.length} modeled operational actions.`;
+}
+
 function mockReply(strategies: RecoveryStrategy[], outcomes: Map<string, SimulationSummary>, state: SimulationState, objective: DecisionCriteria["objective"]): JevReply {
   const best = [...strategies].sort((left, right) => {
     return compareOutcomes(outcomes.get(left.id)!, outcomes.get(right.id)!, objective) || left.id.localeCompare(right.id);
   })[0];
-  const probabilities = Object.fromEntries(strategies.map((strategy) => [strategy.id, strategy.id === best.id ? 0.9 : 0.1 / Math.max(1, strategies.length - 1)]));
+  const probabilities = Object.fromEntries(strategies.map((strategy) => [strategy.id, strategies.length === 1 ? 1 : strategy.id === best.id ? 0.9 : 0.1 / (strategies.length - 1)]));
   return {
     model: "mock-jev",
     selection: { choice: best.id, confidence: 0.9, probabilities },
@@ -202,20 +289,29 @@ export async function createRecommendation(
   partialOptions: Partial<SimulationOptions> = {},
   jevCall: JevCall = callJev,
   criteria: DecisionCriteria = { objective: "balanced" },
+  evaluateStrategies?: StrategyOutcomeEvaluator,
+  additionalCandidates: RecoveryStrategy[] = [],
+  selectAllCandidates = false,
 ): Promise<{ recommendation: Recommendation; strategies: RecoveryStrategy[]; evaluatedStrategies: Array<{ strategy: RecoveryStrategy; outcome: SimulationSummary; affectedShips: string[]; affectedCargo: string[] }> }> {
   const options = { ...DEFAULT_SIMULATION_OPTIONS, ...partialOptions };
-  const generated = generateStrategies(state, options.horizonHours);
+  const baseStrategies = generateStrategies(state, options.horizonHours, criteria, options.criticalCargoOnTimeTargetPercent);
+  if (additionalCandidates.some((candidate) => baseStrategies.some((strategy) => strategy.id === candidate.id))
+    || new Set(additionalCandidates.map((candidate) => candidate.id)).size !== additionalCandidates.length) {
+    throw new Error("Additional recovery candidates must have unique IDs outside the generated candidate set.");
+  }
+  const generated = [...baseStrategies, ...additionalCandidates];
   if (!generated.length) throw new Error("No feasible recovery strategy exists for this state.");
   assertSimulationBudget(state, options, generated.length);
-  const generatedOutcomes = new Map(generated.map((strategy) => [strategy.id, simulateStrategy(state, strategy, options)]));
+  const generatedOutcomes = evaluateStrategies?.(generated) ?? new Map(generated.map((strategy) => [strategy.id, simulateStrategy(state, strategy, options)]));
   const baselineStrategy = generated.find((strategy) => strategy.id === "baseline-arrival-order");
   if (!baselineStrategy) throw new Error("The deterministic baseline strategy could not be generated.");
+  const protectedIds = new Set(additionalCandidates.map((strategy) => strategy.id));
   const outcomeFingerprint = (strategy: RecoveryStrategy) => JSON.stringify({
     mean: generatedOutcomes.get(strategy.id)!.mean,
     probabilityOfMeetingTarget: generatedOutcomes.get(strategy.id)!.probabilityOfMeetingTarget,
   });
   const unique = [baselineStrategy, ...generated.filter((strategy) => strategy.id !== baselineStrategy.id)]
-    .filter((strategy, index, all) => all.findIndex((other) => outcomeFingerprint(other) === outcomeFingerprint(strategy)) === index);
+    .filter((strategy, index, all) => protectedIds.has(strategy.id) || all.findIndex((other) => outcomeFingerprint(other) === outcomeFingerprint(strategy)) === index);
   const dominates = (left: RecoveryStrategy, right: RecoveryStrategy) => {
     const a = generatedOutcomes.get(left.id)!.mean;
     const b = generatedOutcomes.get(right.id)!.mean;
@@ -233,7 +329,7 @@ export async function createRecommendation(
       || generatedOutcomes.get(left.id)!.probabilityOfMeetingTarget > generatedOutcomes.get(right.id)!.probabilityOfMeetingTarget;
     return noWorse && better;
   };
-  const pareto = unique.filter((candidate) => candidate.id === baselineStrategy.id || !unique.some((other) => other.id !== candidate.id && dominates(other, candidate)));
+  const pareto = unique.filter((candidate) => candidate.id === baselineStrategy.id || protectedIds.has(candidate.id) || !unique.some((other) => other.id !== candidate.id && dominates(other, candidate)));
   const generatedMeetsConstraints = (strategy: RecoveryStrategy) => {
     const outcome = generatedOutcomes.get(strategy.id)!;
     return outcome.mean.criticalCargoOnTimePercent >= options.criticalCargoOnTimeTargetPercent
@@ -252,8 +348,9 @@ export async function createRecommendation(
   const compliant = rankedPareto.filter(generatedMeetsConstraints);
   const minimumParetoViolation = Math.min(...rankedPareto.map(violation));
   const preferred = compliant.length ? compliant : rankedPareto.filter((candidate) => violation(candidate) === minimumParetoViolation);
-  // shortcut: send at most 12 non-duplicate Pareto alternatives to Jev to keep the prompt bounded.
-  const strategies = [baselineStrategy, ...preferred, ...rankedPareto.filter((candidate) => !preferred.includes(candidate))].slice(0, 12);
+  // shortcut: send at most 16 non-duplicate Pareto alternatives to Jev to keep the prompt bounded.
+  const strategies = [baselineStrategy, ...additionalCandidates, ...preferred, ...rankedPareto.filter((candidate) => !preferred.includes(candidate))]
+    .filter((strategy, index, all) => all.findIndex((item) => item.id === strategy.id) === index).slice(0, 16);
   const outcomes = new Map(strategies.map((strategy) => [strategy.id, generatedOutcomes.get(strategy.id)!]));
   const meetsConstraints = (strategy: RecoveryStrategy) => {
     const outcome = outcomes.get(strategy.id)!;
@@ -270,13 +367,14 @@ export async function createRecommendation(
     return criticalShortfall + costOverrun;
   };
   const minimumViolation = Math.min(...strategies.map(constraintViolation));
-  const selectableStrategies = constraintCandidates.length ? constraintCandidates
+  const selectableStrategies = selectAllCandidates ? strategies : constraintCandidates.length ? constraintCandidates
     : strategies.filter((strategy) => constraintViolation(strategy) === minimumViolation);
   const selectableIds = selectableStrategies.map((strategy) => strategy.id);
 
   let assessment: JevAssessment | null = null;
   let decisionSource: Recommendation["decisionSource"] = "jev";
   let fallbackReason: string | undefined;
+  let safeguardExplanation: string | undefined;
   const warnings = reviewIndicators(state);
   if ([...Object.values(state.provenance)].some((source) => source === "synthetic" || source === "mixed")) warnings.push("Some simulation inputs are synthetic or combine sources; review provenance before relying on the recommendation.");
   if (state.weather.length) warnings.push("Forecast weather adjustments and sampled capacity reductions are applied on top of the supplied current capacity; confirm the input capacity does not already include those future impacts.");
@@ -298,11 +396,23 @@ export async function createRecommendation(
   } catch (error) {
     decisionSource = "fallback";
     const errorName = error instanceof Error ? error.name : "UnknownError";
-    const safeDecisionError = error instanceof Error && (error.message.startsWith("Jev selected an ID") || error.message.startsWith("Jev returned invalid"));
+    const safeDecisionError = error instanceof Error && (error.message.startsWith("Jev selected an ID") || error.message.startsWith("Jev returned"));
     const detail = error instanceof Error && error.message === "TYPESAFE_API_KEY is not configured." ? error.message
       : safeDecisionError ? error.message : `Jev decision failed (${errorName}).`;
     fallbackReason = detail;
     warnings.push(`${detail} The deterministic arrival-order baseline was selected.`);
+  }
+
+  const proposedStrategy = generated.find((strategy) => strategy.id === selectedStrategyId)!;
+  if (decisionSource !== "fallback" && proposedStrategy.id !== baselineStrategy.id && meetsConstraints(proposedStrategy)) {
+    const quality = assessAdaptivePlanQuality(outcomes.get(proposedStrategy.id)!, outcomes.get(baselineStrategy.id)!, criteria, options.criticalCargoOnTimeTargetPercent);
+    if (!quality.applyProposed && (quality.status === "equivalent" || quality.status === "rejected-dominated")) {
+      selectedStrategyId = baselineStrategy.id;
+      safeguardExplanation = quality.status === "equivalent"
+        ? `Jev selected ${proposedStrategy.name}, but the plans have equivalent measured outcomes, so the no-intervention baseline was retained.`
+        : `Jev selected ${proposedStrategy.name}, but the no-intervention baseline is no worse across measured outcomes and improves at least one, so the no-intervention baseline was retained.`;
+      warnings.push(safeguardExplanation);
+    }
   }
 
   const selectedStrategy = generated.find((strategy) => strategy.id === selectedStrategyId)!;
@@ -316,6 +426,7 @@ export async function createRecommendation(
     generatedAt: new Date().toISOString(),
     selectedStrategyId,
     recommendationSummary: `${selectedStrategy.name}: ${selectedStrategy.summary}`,
+    decisionExplanation: safeguardExplanation ?? decisionExplanation(selectedStrategy, selected, baseline, criteria, options.criticalCargoOnTimeTargetPercent),
     actions: selectedStrategy.actions,
     affectedShips: changedShips,
     affectedCargo,
@@ -343,6 +454,7 @@ export async function createRecommendation(
       candidates: strategies.map((strategy) => ({
         strategyId: strategy.id,
         name: strategy.name,
+        plan: recoveryPlan(strategy),
         actions: strategy.actions,
         metrics: outcomes.get(strategy.id)!.mean,
         probabilityOfMeetingTarget: outcomes.get(strategy.id)!.probabilityOfMeetingTarget,

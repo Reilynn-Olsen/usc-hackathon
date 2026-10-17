@@ -23,7 +23,6 @@ export const SHIPS: Ship[] = [
   { id: "AT-521", name: "Atlas Trader", callSign: "MKG4012", cargo: "Industrial goods", containers: 2870, priority: "Standard", eta: "11:05", status: "Inbound", progress: 0.19, color: "#87a5c4", route: [[-69,40],[-48,31],[-24,23],[3,21],[26,24]] },
   { id: "SC-640", name: "Seaway Crest", callSign: "C6TW2", cargo: "Food & perishables", containers: 1650, priority: "High", eta: "07:50", status: "Inbound", progress: 0.42, color: "#f5ba65", route: [[-69,-52],[-50,-41],[-28,-35],[-3,-35],[26,-35]] },
 ];
-
 export type ScenarioId = "storm" | "fog" | "wind" | "outage";
 export type Scenario = {
   id: ScenarioId;
@@ -42,15 +41,3 @@ export const SCENARIOS: Scenario[] = [
   { id: "wind", label: "Extreme crosswinds", kicker: "WIND ADVISORY", description: "Strong gusts suspend crane operations across exposed container terminals.", impact: "45% capacity loss", intensity: 45, zone: { x: 17, z: -7, radius: 19, color: "#e8a458" }, icon: "wind" },
   { id: "outage", label: "Terminal equipment failure", kicker: "INFRASTRUCTURE", description: "A yard-crane and gate system failure reduces unloading and landside throughput.", impact: "50% capacity loss", intensity: 50, zone: { x: 30, z: 4, radius: 12, color: "#e4777a" }, icon: "outage" },
 ];
-
-export type ActionId = "critical" | "stagger" | "trucks" | "divert";
-export type Action = { id: ActionId; name: string; detail: string; benefit: string };
-export const ACTIONS: Action[] = [
-  { id: "critical", name: "Prioritize critical cargo", detail: "Schedule ships with essential cargo ahead of other vessels.", benefit: "Uses explicit cargo deadlines" },
-  { id: "stagger", name: "Stage selected lower-priority vessels", detail: "Hold eligible vessels for 2, 4, 8, or 12 hours while port resources are constrained.", benefit: "Uses modeled vessel arrival holds" },
-  { id: "trucks", name: "Reserve unloading capacity", detail: "Limit concurrent unloading so essential cargo can use a dedicated position.", benefit: "Uses modeled berths and unloading resources" },
-  { id: "divert", name: "Divert a standard shipment", detail: "Reroute an eligible nonessential vessel to a modeled alternative port.", benefit: "Only offered for feasible alternative ports" },
-];
-
-export type ActionState = Record<ActionId, boolean>;
-export const EMPTY_ACTIONS: ActionState = { critical: false, stagger: false, trucks: false, divert: false };
