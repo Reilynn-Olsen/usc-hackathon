@@ -7,5 +7,6 @@ export const metadata: Metadata = {
 };
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
-  return <html lang="en"><body>{children}</body></html>;
+  // Browser extensions can mutate document-root attributes before React hydrates.
+  return <html lang="en" suppressHydrationWarning><body suppressHydrationWarning>{children}</body></html>;
 }
