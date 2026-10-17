@@ -1,0 +1,17 @@
+node_modules
+.next
+out
+build
+coverage
+.git
+.env*
+.aws
+.codex
+.agents
+*.pem
+*.key
+*.tsbuildinfo
+*-debug.log*
+Dockerfile*
+compose*.yaml
+compose*.yml

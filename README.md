@@ -67,6 +67,29 @@ Run the API route checks with `npm run test:api`.
 
 ## Getting Started
 
+### Docker (app only)
+
+This setup builds and runs the Next.js UI and its API routes. Jev runs in your separately managed container. Docker Compose v2.24 or newer is required.
+
+If you do not already have `.env`, copy `.env.example` to `.env`. Set `TYPESAFE_API_KEY` and `AISSTREAM_API_KEY` there. To use your Jev container, set `TYPESAFE_BASE_URL` to its API root using `http://host.docker.internal:<published-port>` (replace `<published-port>` with Jev's actual published host port). Compose supplies the host alias on Linux. `localhost` inside the app container refers to the app container itself. If `TYPESAFE_BASE_URL` is unset, the SDK uses the hosted TypeSafe API.
+
+```sh
+docker compose up --build -d app
+docker compose logs -f app
+```
+
+Open [http://localhost:3000](http://localhost:3000). For a different app port, use `APP_PORT=8080 docker compose up --build -d app`.
+
+The image uses Node.js 22, Next.js standalone output, and a non-root runtime user. Credentials are passed from `.env` at runtime; `.env.local` is not loaded by this setup. `JEV_MOCK` is ignored in production. Rebuild after source changes.
+
+```sh
+docker compose down
+```
+
+This Compose project is named `harbormind-app`; it defines only the app service and does not manage the Jev container.
+
+### Local development
+
 First, run the development server:
 
 ```bash
