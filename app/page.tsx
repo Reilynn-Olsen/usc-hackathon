@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useState, type CSSProperties } from "react";
 import PortMap3D, { type MapCommand } from "./components/PortMap3D";
-import { ACTIONS, EMPTY_ACTIONS, RECOMMENDED_ACTIONS, SCENARIOS, SHIPS, estimateOutcome, type ActionId, type ActionState, type Outcome, type ScenarioId, type Tab } from "./lib/data";
+import { ACTIONS, EMPTY_ACTIONS, RECOMMENDED_ACTIONS, SCENARIOS, SHIPS, estimateOutcome, type ActionId, type ActionState, type ScenarioId, type Tab } from "./lib/data";
 import { Icon } from "./lib/icons";
 
 const DAY_MONTH: Intl.DateTimeFormatOptions = { month: "short", day: "2-digit" };
@@ -23,7 +23,12 @@ function MapToolbox({ onCommand, onPort }: { onCommand: (kind: MapCommand["kind"
 }
 
 function SeverityIndicator({ level }: { level: "HIGH" | "MODERATE" | "LOW" }) {
-  return <span className={`severity severity--${level.toLowerCase()}`}><span/>{level} RISK</span>;
+  return (
+    <span className={`severity severity--${level.toLowerCase()}`}>
+      <span />
+      {level} RISK
+    </span>
+  );
 }
 
 function ResultStat({ name, value, sub, accent = false }: { name: string; value: string; sub?: string; accent?: boolean }) {
@@ -54,9 +59,12 @@ export default function Page() {
   const [playing, setPlaying] = useState(false);
 
   useEffect(() => {
-    setNow(new Date());
+    const initial = window.setTimeout(() => setNow(new Date()), 0);
     const timer = window.setInterval(() => setNow(new Date()), 60_000);
-    return () => window.clearInterval(timer);
+    return () => {
+      window.clearTimeout(initial);
+      window.clearInterval(timer);
+    };
   }, []);
 
   useEffect(() => {

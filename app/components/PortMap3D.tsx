@@ -47,10 +47,14 @@ const point = (THREE: any, x: number, z: number, y = 1.4) => new THREE.Vector3(x
 export default function PortMap3D({ selectedShip, onSelectShip, weather, simulated = false, scenarioId, command, compact = false, simulationHour = 0 }: Props) {
   const rootRef = useRef<HTMLDivElement>(null);
   const apiRef = useRef<MapApi | null>(null);
+
   const callbackRef = useRef(onSelectShip);
   const [ready, setReady] = useState(false);
   const [error, setError] = useState(false);
-  callbackRef.current = onSelectShip;
+
+  useEffect(() => {
+    callbackRef.current = onSelectShip;
+  }, [onSelectShip]);
 
   useEffect(() => {
     let cancelled = false;
@@ -411,10 +415,11 @@ export default function PortMap3D({ selectedShip, onSelectShip, weather, simulat
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  useEffect(() => { apiRef.current?.setWeather(weather, simulated); }, [weather, simulated]);
-  useEffect(() => { apiRef.current?.setSelected(selectedShip); }, [selectedShip]);
-  useEffect(() => { apiRef.current?.setHour(simulationHour); }, [simulationHour]);
-  useEffect(() => { if (command) apiRef.current?.command(command); }, [command]);
+  // Synchronize again when the asynchronous map initialization finishes.
+  useEffect(() => { if (ready) apiRef.current?.setWeather(weather, simulated); }, [ready, weather, simulated]);
+  useEffect(() => { if (ready) apiRef.current?.setSelected(selectedShip); }, [ready, selectedShip]);
+  useEffect(() => { if (ready) apiRef.current?.setHour(simulationHour); }, [ready, simulationHour]);
+  useEffect(() => { if (ready && command) apiRef.current?.command(command); }, [ready, command]);
 
   return (
     <div className={`port-map-root ${compact ? "port-map-root--compact" : ""}`} ref={rootRef}>

@@ -66,7 +66,6 @@ export type Outcome = {
 
 /** A small, deterministic *illustrative* model, not real port forecasts or Jev output. */
 export function estimateOutcome(scenarioId: ScenarioId, capacityLoss: number, duration: number, actions: ActionState): Outcome {
-  const s = SCENARIOS.find((item) => item.id === scenarioId) ?? SCENARIOS[0];
   const drag = (capacityLoss / 100) * (0.66 + duration / 36);
   const disruption = scenarioId === "storm" ? 1.12 : scenarioId === "fog" ? 0.76 : scenarioId === "wind" ? 0.9 : 1.03;
   const baseOnTime = 94 - drag * 55 * disruption;
