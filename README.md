@@ -1,5 +1,23 @@
 This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
 
+## Port data APIs
+
+- `GET /api/weather` returns a two-day hourly Open-Meteo weather and marine forecast for the Port of Los Angeles.
+- `GET /api/ships` is a Server-Sent Events stream. Listen for `vessel` events with `EventSource`; each event contains an AISStream `PositionReport` message for the San Pedro Bay area.
+
+Set `AISSTREAM_API_KEY` in `.env.local` (copy `.env.example`) before using the ships endpoint. Keep this key server-side; the route does not expose it to the browser. The ships route uses the server's built-in WebSocket, so run it on Node.js 22 or later. The API check script requires Node.js 22.6 or later. Open-Meteo does not require a key.
+
+```js
+const forecast = await fetch("/api/weather").then((response) => response.json());
+const ships = new EventSource("/api/ships");
+ships.addEventListener("vessel", (event) => {
+  const aisMessage = JSON.parse(event.data);
+  // Use aisMessage.MetaData and aisMessage.Message.PositionReport in the harness.
+});
+```
+
+Run the API route checks with `npm run test:api`.
+
 ## Getting Started
 
 First, run the development server:
