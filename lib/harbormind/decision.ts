@@ -1,6 +1,6 @@
 import { choice, noul, score, TypeSafeClient } from "@typesafe-ai/sdk";
 import type { JsonValue } from "@typesafe-ai/sdk";
-import type { JevAssessment, RecoveryStrategy, SimulationOptions, SimulationState, SimulationSummary, Recommendation } from "./types.ts";
+import type { DecisionCriteria, JevAssessment, RecoveryStrategy, SimulationOptions, SimulationState, SimulationSummary, Recommendation } from "./types.ts";
 import { assertSimulationBudget, DEFAULT_SIMULATION_OPTIONS, generateStrategies, simulateStrategy } from "./simulation.ts";
 
 const CARGO_URGENCY_RUBRIC = [
@@ -25,7 +25,7 @@ export type JevReply = {
   timeCritical: number;
 };
 
-export type JevCall = (state: SimulationState, strategies: RecoveryStrategy[], outcomes: Map<string, SimulationSummary>) => Promise<JevReply>;
+export type JevCall = (state: SimulationState, strategies: RecoveryStrategy[], outcomes: Map<string, SimulationSummary>, criteria: DecisionCriteria, targetPercent: number, selectableIds: string[]) => Promise<JevReply>;
 
 function reviewIndicators(state: SimulationState): string[] {
   const result: string[] = [];
@@ -49,6 +49,10 @@ function affectedShipsForStrategy(state: SimulationState, strategy: RecoveryStra
   for (const ship of state.ships) if (strategy.assignments[ship.vesselId] !== baseline.assignments[ship.vesselId]) affected.add(ship.vesselId);
   for (const action of strategy.actions) {
     if (action.type === "delay") affected.add(action.vesselId);
+    if (action.type === "reroute") affected.add(action.vesselId);
+    if (action.type === "reserve-throughput") for (const ship of state.ships) {
+      if (strategy.assignments[ship.vesselId] && hasCriticalCargo(ship)) affected.add(ship.vesselId);
+    }
     if (action.type === "allocate-resources") for (const ship of state.ships) {
       if (strategy.assignments[ship.vesselId] === action.portId && hasCriticalCargo(ship)) affected.add(ship.vesselId);
     }
@@ -56,7 +60,7 @@ function affectedShipsForStrategy(state: SimulationState, strategy: RecoveryStra
   return [...affected];
 }
 
-function modelSummary(state: SimulationState, strategies: RecoveryStrategy[], outcomes: Map<string, SimulationSummary>) {
+function modelSummary(state: SimulationState, strategies: RecoveryStrategy[], outcomes: Map<string, SimulationSummary>, criteria: DecisionCriteria, targetPercent: number, selectableIds: string[]) {
   return {
     scenarioId: state.scenarioId,
     startAt: state.startAt,
@@ -65,6 +69,7 @@ function modelSummary(state: SimulationState, strategies: RecoveryStrategy[], ou
       currentCapacityContainersPerDay: port.currentCapacityContainersPerDay,
       normalCapacityContainersPerDay: port.normalCapacityContainersPerDay,
       availableBerths: port.availableBerths, unloadingResources: port.unloadingResources,
+      rerouteCostPerContainer: port.rerouteCostPerContainer ?? null,
       queueShipIds: port.queueShipIds,
       activeDisruptions: port.activeDisruptions,
     })),
@@ -76,11 +81,39 @@ function modelSummary(state: SimulationState, strategies: RecoveryStrategy[], ou
     weather: state.weather.map((item) => ({ portId: item.portId, forecasts: item.forecasts, alerts: item.alerts })),
     risks: reviewIndicators(state),
     dataProvenance: state.provenance,
-    feasibleStrategies: strategies.map((strategy) => ({
-      id: strategy.id, name: strategy.name, summary: strategy.summary, actions: strategy.actions,
-      simulatedOutcome: outcomes.get(strategy.id)?.mean ?? null,
-      probabilityOfMeetingTarget: outcomes.get(strategy.id)?.probabilityOfMeetingTarget ?? null,
-    })),
+    operatorObjective: {
+      objective: criteria.objective,
+      minimumCriticalCargoOnTimePercent: targetPercent,
+      maximumDisruptionCost: criteria.maximumDisruptionCost ?? null,
+      selectionRule: "If one or more candidates satisfy all objective constraints, select among those candidates; otherwise choose the best available and report the unmet constraints.",
+    },
+    selectableStrategyIds: selectableIds,
+    feasibleStrategies: strategies.map((strategy) => {
+      const outcome = outcomes.get(strategy.id);
+      const cost = outcome?.mean.estimatedDisruptionCost;
+      return {
+        id: strategy.id, name: strategy.name, summary: strategy.summary, operationalActions: strategy.actions,
+        metrics: outcome?.mean ?? null,
+        estimatedTargetSuccessProbability: outcome?.probabilityOfMeetingTarget ?? null,
+        selectionEligible: selectableIds.includes(strategy.id),
+        constraints: {
+          feasible: true,
+          criticalDeliveryTarget: outcome ? outcome.mean.criticalCargoOnTimePercent >= targetPercent : false,
+          costLimit: criteria.maximumDisruptionCost === undefined ? null : cost === null || cost === undefined ? false : cost <= criteria.maximumDisruptionCost,
+          capacity: state.ports.filter((port) => state.ships.some((ship) => strategy.assignments[ship.vesselId] === port.portId)).map((port) => ({
+            portId: port.portId,
+            assignedVesselIds: state.ships.filter((ship) => strategy.assignments[ship.vesselId] === port.portId).map((ship) => ship.vesselId),
+            assignedContainers: state.ships.filter((ship) => strategy.assignments[ship.vesselId] === port.portId).reduce((sum, ship) => sum + ship.cargo.reduce((cargoSum, cargo) => cargoSum + cargo.containers, 0), 0),
+            availableBerths: port.availableBerths,
+            unloadingResources: port.unloadingResources,
+            currentCapacityContainersPerDay: port.currentCapacityContainersPerDay,
+            rerouteCostPerContainer: port.rerouteCostPerContainer ?? null,
+            activeDisruptions: port.activeDisruptions,
+          })),
+        },
+        uncertainty: outcome ? { monteCarloRuns: outcome.runs, seed: outcome.seed, targetSuccessProbability: outcome.probabilityOfMeetingTarget } : null,
+      };
+    }),
   };
 }
 
@@ -88,14 +121,14 @@ const probabilityRecord = (value: object) => Object.fromEntries(Object.entries(v
 const legendRecord = (value: object) => Object.fromEntries(Object.entries(value)) as Record<string, string>;
 const hasCriticalCargo = (ship: SimulationState["ships"][number]) => ship.cargo.some((cargo) => cargo.essential);
 
-export const callJev: JevCall = async (state, strategies, outcomes) => {
+export const callJev: JevCall = async (state, strategies, outcomes, criteria, targetPercent, selectableIds) => {
   if (!process.env.TYPESAFE_API_KEY) throw new Error("TYPESAFE_API_KEY is not configured.");
-  const available = Object.fromEntries(strategies.map((strategy) => [strategy.id, strategy.name + ": " + strategy.summary]));
+  const available = Object.fromEntries(strategies.filter((strategy) => selectableIds.includes(strategy.id)).map((strategy) => [strategy.id, strategy.name + ": " + strategy.summary]));
   const client = new TypeSafeClient({ logLevel: "error", timeout: 10_000, retry: { maxRetries: 0 } });
   const response = await client.systemOne({
-    state: JSON.parse(JSON.stringify(modelSummary(state, strategies, outcomes))) as Record<string, JsonValue>,
+    state: JSON.parse(JSON.stringify(modelSummary(state, strategies, outcomes, criteria, targetPercent, selectableIds))) as Record<string, JsonValue>,
     questions: {
-      selection: choice("Select the best feasible recovery strategy by its exact ID. Use only the listed candidates and their simulated outcomes.", available),
+      selection: choice(`Select the feasible recovery strategy best matched to the operator objective "${criteria.objective}". Use the supplied simulated outcomes and choose only an ID listed in selectableStrategyIds; candidates marked selectionEligible=false are not selectable. Respect the critical-delivery target of ${targetPercent}%${criteria.maximumDisruptionCost === undefined ? "" : ` and the disruption-cost limit of $${criteria.maximumDisruptionCost}`}. A cost objective should prefer the cheaper plan when it satisfies the delivery target.`, available),
       cargoUrgency: score("Score cargo urgency from 0 to 3 using the ordered rubric. Consider essential classification, explicit deadlines, and estimated consequences of delay.", CARGO_URGENCY_RUBRIC),
       operationalRisk: score("Score operational risk from 0 to 3 using the ordered rubric. Consider capacity constraints, weather, active disruptions, and simulated outcome likelihoods.", OPERATIONAL_RISK_RUBRIC),
       humanReview: noul("Should a human port operator review this recommendation before any operational decision is approved?"),
@@ -133,13 +166,23 @@ function validateJevReply(reply: JevReply, strategies: RecoveryStrategy[]): JevA
   };
 }
 
-function mockReply(strategies: RecoveryStrategy[], outcomes: Map<string, SimulationSummary>, state: SimulationState): JevReply {
+function compareOutcomes(left: SimulationSummary, right: SimulationSummary, objective: DecisionCriteria["objective"]): number {
+  const a = left.mean;
+  const b = right.mean;
+  const delay = a.averageCargoDelayHours - b.averageCargoDelayHours;
+  const cost = a.estimatedDisruptionCost === null ? b.estimatedDisruptionCost === null ? 0 : 1
+    : b.estimatedDisruptionCost === null ? -1 : a.estimatedDisruptionCost - b.estimatedDisruptionCost;
+  const critical = b.criticalCargoOnTimePercent - a.criticalCargoOnTimePercent;
+  const success = right.probabilityOfMeetingTarget - left.probabilityOfMeetingTarget;
+  if (objective === "critical-delivery") return critical || success || delay || cost;
+  if (objective === "minimize-delay") return delay || critical || success || cost;
+  if (objective === "minimize-cost") return cost || success || critical || delay;
+  return success || critical || delay || cost;
+}
+
+function mockReply(strategies: RecoveryStrategy[], outcomes: Map<string, SimulationSummary>, state: SimulationState, objective: DecisionCriteria["objective"]): JevReply {
   const best = [...strategies].sort((left, right) => {
-    const a = outcomes.get(left.id)!.mean;
-    const b = outcomes.get(right.id)!.mean;
-    return outcomes.get(right.id)!.probabilityOfMeetingTarget - outcomes.get(left.id)!.probabilityOfMeetingTarget
-      || b.criticalCargoOnTimePercent - a.criticalCargoOnTimePercent
-      || (a.estimatedDelayCost ?? 0) - (b.estimatedDelayCost ?? 0);
+    return compareOutcomes(outcomes.get(left.id)!, outcomes.get(right.id)!, objective) || left.id.localeCompare(right.id);
   })[0];
   const probabilities = Object.fromEntries(strategies.map((strategy) => [strategy.id, strategy.id === best.id ? 0.9 : 0.1 / Math.max(1, strategies.length - 1)]));
   return {
@@ -156,14 +199,78 @@ export async function createRecommendation(
   state: SimulationState,
   partialOptions: Partial<SimulationOptions> = {},
   jevCall: JevCall = callJev,
+  criteria: DecisionCriteria = { objective: "balanced" },
 ): Promise<{ recommendation: Recommendation; strategies: RecoveryStrategy[]; evaluatedStrategies: Array<{ strategy: RecoveryStrategy; outcome: SimulationSummary; affectedShips: string[]; affectedCargo: string[] }> }> {
   const options = { ...DEFAULT_SIMULATION_OPTIONS, ...partialOptions };
-  const strategies = generateStrategies(state, options.horizonHours);
-  if (!strategies.length) throw new Error("No feasible recovery strategy exists for this state.");
-  assertSimulationBudget(state, options, strategies.length);
-  const outcomes = new Map(strategies.map((strategy) => [strategy.id, simulateStrategy(state, strategy, options)]));
-  const baselineStrategy = strategies.find((strategy) => strategy.id === "baseline-arrival-order");
+  const generated = generateStrategies(state, options.horizonHours);
+  if (!generated.length) throw new Error("No feasible recovery strategy exists for this state.");
+  assertSimulationBudget(state, options, generated.length);
+  const generatedOutcomes = new Map(generated.map((strategy) => [strategy.id, simulateStrategy(state, strategy, options)]));
+  const baselineStrategy = generated.find((strategy) => strategy.id === "baseline-arrival-order");
   if (!baselineStrategy) throw new Error("The deterministic baseline strategy could not be generated.");
+  const outcomeFingerprint = (strategy: RecoveryStrategy) => JSON.stringify({
+    mean: generatedOutcomes.get(strategy.id)!.mean,
+    probabilityOfMeetingTarget: generatedOutcomes.get(strategy.id)!.probabilityOfMeetingTarget,
+  });
+  const unique = [baselineStrategy, ...generated.filter((strategy) => strategy.id !== baselineStrategy.id)]
+    .filter((strategy, index, all) => all.findIndex((other) => outcomeFingerprint(other) === outcomeFingerprint(strategy)) === index);
+  const dominates = (left: RecoveryStrategy, right: RecoveryStrategy) => {
+    const a = generatedOutcomes.get(left.id)!.mean;
+    const b = generatedOutcomes.get(right.id)!.mean;
+    const costNoWorse = a.estimatedDisruptionCost === null ? b.estimatedDisruptionCost === null : b.estimatedDisruptionCost === null || a.estimatedDisruptionCost <= b.estimatedDisruptionCost;
+    const costBetter = a.estimatedDisruptionCost !== null && (b.estimatedDisruptionCost === null || a.estimatedDisruptionCost < b.estimatedDisruptionCost);
+    const noWorse = a.criticalCargoOnTimePercent >= b.criticalCargoOnTimePercent
+      && a.averageCargoDelayHours <= b.averageCargoDelayHours
+      && a.totalContainersProcessed >= b.totalContainersProcessed
+      && costNoWorse
+      && generatedOutcomes.get(left.id)!.probabilityOfMeetingTarget >= generatedOutcomes.get(right.id)!.probabilityOfMeetingTarget;
+    const better = a.criticalCargoOnTimePercent > b.criticalCargoOnTimePercent
+      || a.averageCargoDelayHours < b.averageCargoDelayHours
+      || a.totalContainersProcessed > b.totalContainersProcessed
+      || costBetter
+      || generatedOutcomes.get(left.id)!.probabilityOfMeetingTarget > generatedOutcomes.get(right.id)!.probabilityOfMeetingTarget;
+    return noWorse && better;
+  };
+  const pareto = unique.filter((candidate) => candidate.id === baselineStrategy.id || !unique.some((other) => other.id !== candidate.id && dominates(other, candidate)));
+  const generatedMeetsConstraints = (strategy: RecoveryStrategy) => {
+    const outcome = generatedOutcomes.get(strategy.id)!;
+    return outcome.mean.criticalCargoOnTimePercent >= options.criticalCargoOnTimeTargetPercent
+      && (criteria.maximumDisruptionCost === undefined || outcome.mean.estimatedDisruptionCost !== null && outcome.mean.estimatedDisruptionCost <= criteria.maximumDisruptionCost);
+  };
+  const violation = (strategy: RecoveryStrategy) => {
+    const outcome = generatedOutcomes.get(strategy.id)!;
+    const criticalShortfall = Math.max(0, options.criticalCargoOnTimeTargetPercent - outcome.mean.criticalCargoOnTimePercent) / 100;
+    const costOverrun = criteria.maximumDisruptionCost === undefined ? 0
+      : outcome.mean.estimatedDisruptionCost === null ? 1
+        : Math.max(0, outcome.mean.estimatedDisruptionCost - criteria.maximumDisruptionCost) / Math.max(1, criteria.maximumDisruptionCost);
+    return criticalShortfall + costOverrun;
+  };
+  const rankedPareto = pareto.filter((candidate) => candidate.id !== baselineStrategy.id)
+    .sort((left, right) => compareOutcomes(generatedOutcomes.get(left.id)!, generatedOutcomes.get(right.id)!, criteria.objective) || left.id.localeCompare(right.id));
+  const compliant = rankedPareto.filter(generatedMeetsConstraints);
+  const minimumParetoViolation = Math.min(...rankedPareto.map(violation));
+  const preferred = compliant.length ? compliant : rankedPareto.filter((candidate) => violation(candidate) === minimumParetoViolation);
+  // shortcut: send at most 12 non-duplicate Pareto alternatives to Jev to keep the prompt bounded.
+  const strategies = [baselineStrategy, ...preferred, ...rankedPareto.filter((candidate) => !preferred.includes(candidate))].slice(0, 12);
+  const outcomes = new Map(strategies.map((strategy) => [strategy.id, generatedOutcomes.get(strategy.id)!]));
+  const meetsConstraints = (strategy: RecoveryStrategy) => {
+    const outcome = outcomes.get(strategy.id)!;
+    return outcome.mean.criticalCargoOnTimePercent >= options.criticalCargoOnTimeTargetPercent
+      && (criteria.maximumDisruptionCost === undefined || outcome.mean.estimatedDisruptionCost !== null && outcome.mean.estimatedDisruptionCost <= criteria.maximumDisruptionCost);
+  };
+  const constraintCandidates = strategies.filter(meetsConstraints);
+  const constraintViolation = (strategy: RecoveryStrategy) => {
+    const outcome = outcomes.get(strategy.id)!;
+    const criticalShortfall = Math.max(0, options.criticalCargoOnTimeTargetPercent - outcome.mean.criticalCargoOnTimePercent) / 100;
+    const costOverrun = criteria.maximumDisruptionCost === undefined ? 0
+      : outcome.mean.estimatedDisruptionCost === null ? 1
+        : Math.max(0, outcome.mean.estimatedDisruptionCost - criteria.maximumDisruptionCost) / Math.max(1, criteria.maximumDisruptionCost);
+    return criticalShortfall + costOverrun;
+  };
+  const minimumViolation = Math.min(...strategies.map(constraintViolation));
+  const selectableStrategies = constraintCandidates.length ? constraintCandidates
+    : strategies.filter((strategy) => constraintViolation(strategy) === minimumViolation);
+  const selectableIds = selectableStrategies.map((strategy) => strategy.id);
 
   let assessment: JevAssessment | null = null;
   let decisionSource: Recommendation["decisionSource"] = "jev";
@@ -171,13 +278,16 @@ export async function createRecommendation(
   const warnings = reviewIndicators(state);
   if ([...Object.values(state.provenance)].some((source) => source === "synthetic" || source === "mixed")) warnings.push("Some simulation inputs are synthetic or combine sources; review provenance before relying on the recommendation.");
   if (state.weather.length) warnings.push("Forecast weather adjustments and sampled capacity reductions are applied on top of the supplied current capacity; confirm the input capacity does not already include those future impacts.");
-  warnings.push("Each vessel manifest is modeled as one unloading job; all cargo aboard is treated as delivered when that vessel's unloading completes.");
-  if (state.ships.some((ship) => ship.cargo.some((cargo) => cargo.delayCostPerContainerHour !== undefined)) && state.ships.some((ship) => ship.cargo.some((cargo) => cargo.delayCostPerContainerHour === undefined))) warnings.push("Estimated delay cost is omitted because cost inputs are incomplete for some cargo.");
+  if (state.ships.some((ship) => ship.cargo.some((cargo) => cargo.delayCostPerContainerHour === undefined))) warnings.push("Total disruption cost is unavailable or incomplete because cargo delay-cost inputs are missing.");
+  if (generated.some((strategy) => strategy.actions.some((action) => action.type === "reroute"))
+    && state.ports.some((port) => generated.some((strategy) => state.ships.some((ship) => strategy.assignments[ship.vesselId] === port.portId && ship.destinationPortId !== port.portId)) && port.rerouteCostPerContainer === undefined)) {
+    warnings.push("Some feasible reroutes have no modeled alternate-port charge; their total disruption cost is unavailable and they cannot satisfy a configured cost limit.");
+  }
   let selectedStrategyId = baselineStrategy.id;
   const useMock = process.env.JEV_MOCK === "true" && process.env.NODE_ENV !== "production";
   try {
-    const reply = useMock ? mockReply(strategies, outcomes, state) : await jevCall(state, strategies, outcomes);
-    assessment = validateJevReply(reply, strategies);
+    const reply = useMock ? mockReply(selectableStrategies, outcomes, state, criteria.objective) : await jevCall(state, strategies, outcomes, criteria, options.criticalCargoOnTimeTargetPercent, selectableIds);
+    assessment = validateJevReply(reply, selectableStrategies);
     selectedStrategyId = assessment.selection.strategyId;
     if (useMock) {
       decisionSource = "mock";
@@ -193,7 +303,7 @@ export async function createRecommendation(
     warnings.push(`${detail} The deterministic arrival-order baseline was selected.`);
   }
 
-  const selectedStrategy = strategies.find((strategy) => strategy.id === selectedStrategyId)!;
+  const selectedStrategy = generated.find((strategy) => strategy.id === selectedStrategyId)!;
   const selected = outcomes.get(selectedStrategyId)!;
   const baseline = outcomes.get(baselineStrategy.id)!;
   const changedShips = affectedShipsForStrategy(state, selectedStrategy, baselineStrategy);
@@ -222,6 +332,22 @@ export async function createRecommendation(
     humanApprovalRequired: true,
     dataProvenance: state.provenance,
     warnings: [...new Set(warnings)],
+    decisionAudit: {
+      objective: criteria.objective,
+      minimumCriticalCargoOnTimePercent: options.criticalCargoOnTimeTargetPercent,
+      maximumDisruptionCost: criteria.maximumDisruptionCost ?? null,
+      selectedStrategyId,
+      fallback: decisionSource === "fallback",
+      candidates: strategies.map((strategy) => ({
+        strategyId: strategy.id,
+        name: strategy.name,
+        actions: strategy.actions,
+        metrics: outcomes.get(strategy.id)!.mean,
+        probabilityOfMeetingTarget: outcomes.get(strategy.id)!.probabilityOfMeetingTarget,
+        meetsConstraints: meetsConstraints(strategy),
+        selectionEligible: selectableIds.includes(strategy.id),
+      })),
+    },
   };
   const evaluatedStrategies = strategies.map((strategy) => {
     const affectedShips = affectedShipsForStrategy(state, strategy, baselineStrategy);

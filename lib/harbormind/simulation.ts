@@ -37,6 +37,10 @@ const containersFor = (ship: Ship) => ship.cargo.reduce((sum, cargo) => sum + ca
 const hasCriticalCargo = (ship: Ship) => ship.cargo.some((cargo) => cargo.essential);
 const isNonessential = (ship: Ship) => ship.cargo.every((cargo) => !cargo.essential);
 
+function arrivalPriority(state: SimulationState, left: Ship, right: Ship): number {
+  return Date.parse(left.estimatedArrival) - Date.parse(right.estimatedArrival) || state.ships.indexOf(left) - state.ships.indexOf(right);
+}
+
 function criticalPriority(state: SimulationState, left: Ship, right: Ship): number {
   const criticalVolume = (ship: Ship) => ship.cargo.reduce((sum, cargo) => sum + (cargo.essential ? cargo.containers : 0), 0);
   const deadline = (ship: Ship) => Math.min(...ship.cargo.filter((cargo) => cargo.essential).map((cargo) => Date.parse(cargo.deadline)), Infinity);
@@ -44,24 +48,31 @@ function criticalPriority(state: SimulationState, left: Ship, right: Ship): numb
   if (deadlineDifference) return deadlineDifference;
   const volumeDifference = criticalVolume(right) - criticalVolume(left);
   if (volumeDifference) return volumeDifference;
-  return Date.parse(left.estimatedArrival) - Date.parse(right.estimatedArrival) || state.ships.indexOf(left) - state.ships.indexOf(right);
+  return arrivalPriority(state, left, right);
 }
 
-function orderFor(state: SimulationState, scheduling: RecoveryStrategy["scheduling"]): Ship[] {
-  return [...state.ships].sort(scheduling === "arrival-order"
-    ? (left, right) => Date.parse(left.estimatedArrival) - Date.parse(right.estimatedArrival) || state.ships.indexOf(left) - state.ships.indexOf(right)
-    : (left, right) => criticalPriority(state, left, right));
+function deadlineSlackHours(state: SimulationState, ship: Ship, portId: string): number {
+  const port = state.ports.find((item) => item.portId === portId);
+  const throughput = Math.max(0.01, (port?.currentCapacityContainersPerDay ?? 0) / 24);
+  const arrivalHour = Math.max(0, (Date.parse(ship.estimatedArrival) - Date.parse(state.startAt)) / 3_600_000);
+  return Math.min(...ship.cargo.map((cargo) => (Date.parse(cargo.deadline) - Date.parse(state.startAt)) / 3_600_000
+    - arrivalHour - cargo.containers / throughput), Infinity);
 }
 
-function orderedIds(state: SimulationState, scheduling: RecoveryStrategy["scheduling"]): string[] {
-  return orderFor(state, scheduling).map((ship) => ship.vesselId);
+function orderFor(state: SimulationState, scheduling: RecoveryStrategy["scheduling"], assignments: Record<string, string>): Ship[] {
+  const comparator = scheduling === "arrival-order" ? (left: Ship, right: Ship) => arrivalPriority(state, left, right)
+    : scheduling === "critical-first" ? (left: Ship, right: Ship) => criticalPriority(state, left, right)
+      : (left: Ship, right: Ship) => deadlineSlackHours(state, left, assignments[left.vesselId]) - deadlineSlackHours(state, right, assignments[right.vesselId])
+        || Number(hasCriticalCargo(right)) - Number(hasCriticalCargo(left)) || arrivalPriority(state, left, right);
+  return [...state.ships].sort(comparator);
 }
 
 function makeStrategy(
   state: SimulationState,
   input: Omit<RecoveryStrategy, "actions">,
 ): RecoveryStrategy {
-  const order = orderedIds(state, input.scheduling);
+  const orderedShips = orderFor(state, input.scheduling, input.assignments);
+  const order = orderedShips.map((ship) => ship.vesselId);
   const actions: StrategyAction[] = [];
   if (input.scheduling === "critical-first") {
     actions.push({ type: "prioritize", vesselIds: order.filter((id) => hasCriticalCargo(state.ships.find((ship) => ship.vesselId === id)!)), reason: "Move essential cargo with the earliest deadlines ahead of nonessential freight." });
@@ -69,10 +80,12 @@ function makeStrategy(
   for (const port of state.ports) if (input.resourceMode === "dedicated-priority" && Math.min(port.availableBerths, port.unloadingResources) > 1 && state.ships.some((ship) => input.assignments[ship.vesselId] === port.portId && hasCriticalCargo(ship))) {
     actions.push({ type: "allocate-resources", portId: port.portId, concurrentVessels: 1 });
   }
-  for (const ship of orderFor(state, input.scheduling)) {
+  if (input.criticalCapacityReservationPercent !== null) actions.push({ type: "reserve-throughput", criticalPercent: input.criticalCapacityReservationPercent });
+  for (const ship of orderedShips) {
     const portId = input.assignments[ship.vesselId];
     actions.push({ type: "schedule", vesselId: ship.vesselId, portId });
-    if (input.holdNonessentialHours > 0 && isNonessential(ship)) actions.push({ type: "delay", vesselId: ship.vesselId, hours: input.holdNonessentialHours, reason: "Release constrained unloading capacity for essential cargo." });
+    const delayHours = input.stagingHoursByVessel[ship.vesselId];
+    if (delayHours) actions.push({ type: "delay", vesselId: ship.vesselId, hours: delayHours, reason: "Release constrained unloading capacity for higher-risk cargo." });
     if (portId !== ship.destinationPortId) actions.push({ type: "reroute", vesselId: ship.vesselId, fromPortId: ship.destinationPortId, toPortId: portId });
   }
   return { ...input, actions };
@@ -80,12 +93,19 @@ function makeStrategy(
 
 function isFeasible(state: SimulationState, strategy: RecoveryStrategy, horizonHours: number): boolean {
   if (Object.keys(strategy.assignments).length !== state.ships.length) return false;
+  if (Object.entries(strategy.stagingHoursByVessel).some(([vesselId, hours]) => {
+    const ship = state.ships.find((item) => item.vesselId === vesselId);
+    return !ship || isNonessential(ship) === false || ![2, 4, 8, 12].includes(hours);
+  })) return false;
+  if (strategy.criticalCapacityReservationPercent !== null && (!Number.isFinite(strategy.criticalCapacityReservationPercent)
+    || strategy.criticalCapacityReservationPercent <= 0 || strategy.criticalCapacityReservationPercent >= 100
+    || !state.ships.some(hasCriticalCargo) || !state.ships.some(isNonessential))) return false;
   const portLoads = new Map<string, number>();
   for (const ship of state.ships) {
     const targetId = strategy.assignments[ship.vesselId];
     const target = state.ports.find((port) => port.portId === targetId);
     if (!target) return false;
-    if (targetId !== ship.destinationPortId && !ship.eligibleAlternativePortIds.includes(targetId)) return false;
+    if (targetId !== ship.destinationPortId && (hasCriticalCargo(ship) || !ship.eligibleAlternativePortIds.includes(targetId))) return false;
     if (targetId !== ship.destinationPortId && (target.currentCapacityContainersPerDay <= 0 || target.availableBerths < 1 || target.unloadingResources < 1)) return false;
     if (ship.cargo.some((cargo) => cargo.specialHandling.some((need) => !target.supportedHandling.includes(need)))) return false;
     portLoads.set(targetId, (portLoads.get(targetId) ?? 0) + containersFor(ship));
@@ -101,34 +121,49 @@ function isFeasible(state: SimulationState, strategy: RecoveryStrategy, horizonH
 
 export function generateStrategies(state: SimulationState, horizonHours = DEFAULT_SIMULATION_OPTIONS.horizonHours): RecoveryStrategy[] {
   const assignments = Object.fromEntries(state.ships.map((ship) => [ship.vesselId, ship.destinationPortId]));
-  const candidates = [
-    makeStrategy(state, { id: "baseline-arrival-order", name: "Normal arrival order", summary: "Process vessels in estimated arrival order using available unloading resources.", scheduling: "arrival-order", resourceMode: "available", holdNonessentialHours: 0, assignments }),
-    makeStrategy(state, { id: "critical-cargo-first", name: "Prioritize critical cargo", summary: "Schedule ships carrying essential cargo first, ordered by earliest critical deadline and then cargo volume.", scheduling: "critical-first", resourceMode: "available", holdNonessentialHours: 0, assignments }),
-  ];
-  if (state.ports.some((port) => Math.min(port.availableBerths, port.unloadingResources) > 1)) {
-    candidates.push(makeStrategy(state, { id: "dedicated-critical-capacity", name: "Reserve capacity for critical cargo", summary: "Reserve one berth and unloading resource for essential cargo; downstream landside capacity is not modeled.", scheduling: "critical-first", resourceMode: "dedicated-priority", holdNonessentialHours: 0, assignments }));
+  const candidates: RecoveryStrategy[] = [];
+  const signatures = new Set<string>();
+  // shortcut: cap strategy evaluations at 20; raise this only with a matching simulation-budget increase.
+  const maxCandidates = 20;
+  const add = (input: Omit<RecoveryStrategy, "actions">) => {
+    const strategy = makeStrategy(state, input);
+    const signature = JSON.stringify([strategy.scheduling, strategy.resourceMode, strategy.stagingHoursByVessel, strategy.criticalCapacityReservationPercent, strategy.assignments]);
+    if (candidates.length < maxCandidates && !signatures.has(signature) && isFeasible(state, strategy, horizonHours)) {
+      signatures.add(signature);
+      candidates.push(strategy);
+    }
+  };
+  const base = { resourceMode: "available" as const, stagingHoursByVessel: {}, criticalCapacityReservationPercent: null, assignments };
+  add({ ...base, id: "baseline-arrival-order", name: "Normal arrival order", summary: "Process vessels in estimated arrival order using available unloading resources.", scheduling: "arrival-order" });
+  add({ ...base, id: "critical-cargo-first", name: "Prioritize critical cargo", summary: "Schedule ships carrying essential cargo first, ordered by earliest critical deadline and then cargo volume.", scheduling: "critical-first" });
+  add({ ...base, id: "deadline-risk-first", name: "Schedule by deadline risk", summary: "Schedule vessels by the least slack between their expected arrival, estimated handling time, and cargo deadlines.", scheduling: "deadline-risk-first" });
+
+  if (state.ports.some((port) => Math.min(port.availableBerths, port.unloadingResources) > 1 && state.ships.some((ship) => assignments[ship.vesselId] === port.portId && hasCriticalCargo(ship)))) {
+    add({ ...base, id: "dedicated-critical-capacity", name: "Reserve berth capacity for critical cargo", summary: "Keep one modeled berth and unloading position available for essential cargo while it is waiting.", scheduling: "critical-first", resourceMode: "dedicated-priority" });
   }
-  if (state.ships.some(isNonessential)) {
-    candidates.push(makeStrategy(state, { id: "stage-lower-priority", name: "Temporarily stage lower-priority ships", summary: "Hold nonessential ships for 8 hours while essential cargo moves first.", scheduling: "critical-first", resourceMode: "available", holdNonessentialHours: 8, assignments }));
+  if (state.ships.some(hasCriticalCargo) && state.ships.some(isNonessential)) {
+    for (const percent of [25, 50, 75]) add({ ...base, id: `reserve-critical-throughput-${percent}`, name: `Reserve ${percent}% of throughput for critical cargo`, summary: `Allocate ${percent}% of each available throughput interval to essential cargo first, then use remaining capacity for other freight.`, scheduling: "deadline-risk-first", criticalCapacityReservationPercent: percent });
   }
-  const baseCount = candidates.length;
-  const rerouteCandidates = state.ships.filter(isNonessential).flatMap((ship) => ship.eligibleAlternativePortIds.map((portId) => ({ ship, portId })));
-  let feasibleReroutes = 0;
-  for (const { ship, portId } of rerouteCandidates) {
+
+  const standardShips = state.ships.filter((ship) => isNonessential(ship) && ship.cargo.length > 0);
+  const durations = [2, 4, 8, 12];
+  for (let index = 0; index < durations.length && standardShips.length; index++) {
+    const ship = standardShips[0];
+    const hours = durations[index];
+    add({ ...base, id: `stage-${ship.vesselId}-${hours}h`, name: `Stage ${ship.vesselId} for ${hours} hours`, summary: `Hold ${ship.vesselId} for ${hours} hours while the selected scheduling policy assigns constrained capacity.`, scheduling: "critical-first", stagingHoursByVessel: { [ship.vesselId]: hours } });
+  }
+  if (standardShips.length) {
+    const ship = standardShips[0];
+    add({ ...base, id: `stage-${ship.vesselId}-8h-deadline`, name: `Stage ${ship.vesselId} with deadline-risk scheduling`, summary: `Hold ${ship.vesselId} for 8 hours and prioritize the cargo with the least deadline slack.`, scheduling: "deadline-risk-first", stagingHoursByVessel: { [ship.vesselId]: 8 } });
+    // shortcut: offer extra 8-hour staging candidates for two more vessels; the overall candidate cap bounds larger states.
+    for (const other of standardShips.slice(1, 4)) add({ ...base, id: `stage-${other.vesselId}-8h`, name: `Stage ${other.vesselId} for 8 hours`, summary: `Hold ${other.vesselId} for 8 hours while essential cargo moves through the constrained port.`, scheduling: "critical-first", stagingHoursByVessel: { [other.vesselId]: 8 } });
+  }
+
+  for (const ship of standardShips) for (const portId of ship.eligibleAlternativePortIds) {
     const rerouteAssignments = { ...assignments, [ship.vesselId]: portId };
-    const reroute = makeStrategy(state, {
-      id: `reroute-${ship.vesselId}-${portId}`,
-      name: `Reroute ${ship.vesselId} to ${portId}`,
-      summary: `Move ${ship.vesselId} to its explicitly modeled alternative port and retain critical-first scheduling.`,
-      scheduling: "critical-first", resourceMode: "available", holdNonessentialHours: 0, assignments: rerouteAssignments,
-    });
-    if (!isFeasible(state, reroute, horizonHours)) continue;
-    candidates.push(reroute);
-    feasibleReroutes++;
-    // shortcut: show the first 20 feasible reroutes; batch additional candidates when scenarios exceed this limit.
-    if (feasibleReroutes === 20) break;
+    add({ ...base, id: `reroute-${ship.vesselId}-${portId}-deadline-risk`, name: `Reroute ${ship.vesselId} to ${portId}`, summary: `Move ${ship.vesselId} to its modeled alternative port and schedule by deadline risk.`, scheduling: "deadline-risk-first", assignments: rerouteAssignments });
   }
-  return candidates.slice(0, baseCount).filter((candidate) => isFeasible(state, candidate, horizonHours)).concat(candidates.slice(baseCount));
+  return candidates;
 }
 
 export function generateStrategyForPlan(state: SimulationState, plan: RecoveryPlanSelection, horizonHours = DEFAULT_SIMULATION_OPTIONS.horizonHours): RecoveryStrategy | undefined {
@@ -151,12 +186,13 @@ export function generateStrategyForPlan(state: SimulationState, plan: RecoveryPl
       summary: [
         plan.prioritizeCriticalCargo && "schedule essential cargo first",
         plan.staggerLowerPriorityVessels && "hold lower-priority vessels for 8 hours",
-        plan.reserveCapacityForCriticalCargo && "reserve one berth and unloading resource for essential cargo; downstream landside capacity is not modeled",
+        plan.reserveCapacityForCriticalCargo && "reserve one berth and unloading resource for essential cargo",
         diversion.ship && `reroute ${diversion.ship.vesselId} to ${diversion.portId}`,
       ].filter(Boolean).join("; ") || "Process vessels in estimated arrival order using available unloading resources.",
       scheduling: plan.prioritizeCriticalCargo ? "critical-first" : "arrival-order",
       resourceMode: plan.reserveCapacityForCriticalCargo ? "dedicated-priority" : "available",
-      holdNonessentialHours: plan.staggerLowerPriorityVessels ? 8 : 0,
+      stagingHoursByVessel: plan.staggerLowerPriorityVessels ? Object.fromEntries(state.ships.filter(isNonessential).map((ship) => [ship.vesselId, 8])) : {},
+      criticalCapacityReservationPercent: null,
       assignments: nextAssignments,
     });
     if (isFeasible(state, strategy, horizonHours)) return strategy;
@@ -253,7 +289,7 @@ function simulateRun(
   captureReplay = false,
 ): Trial {
   const startMs = Date.parse(state.startAt);
-  const order = orderedIds(state, strategy.scheduling);
+  const order = orderFor(state, strategy.scheduling, strategy.assignments).map((ship) => ship.vesselId);
   const orderIndex = new Map(order.map((vesselId, index) => [vesselId, index]));
   const jobs: VesselJob[] = state.ships.map((ship) => {
     const arrivalHour = Math.max(0, (Date.parse(ship.estimatedArrival) - startMs) / 3_600_000 + random() * options.maxArrivalDelayHours);
@@ -261,7 +297,7 @@ function simulateRun(
       ship,
       portId: strategy.assignments[ship.vesselId],
       arrivalHour,
-      eligibleHour: arrivalHour + (isNonessential(ship) ? strategy.holdNonessentialHours : 0),
+      eligibleHour: arrivalHour + (strategy.stagingHoursByVessel[ship.vesselId] ?? 0),
       status: "scheduled",
       berthId: null,
       berthAtHour: null,
@@ -281,6 +317,11 @@ function simulateRun(
   const criticalContainerCount = allCargo.reduce((sum, item) => sum + (item.cargo.essential ? item.cargo.containers : 0), 0);
   const totalCargoContainers = allCargo.reduce((sum, item) => sum + item.cargo.containers, 0);
   const hasCompleteCostInputs = allCargo.length > 0 && allCargo.every((item) => item.cargo.delayCostPerContainerHour !== undefined);
+  const reroutedJobs = jobs.filter((job) => job.portId !== job.ship.destinationPortId);
+  const hasCompleteRerouteCostInputs = reroutedJobs.every((job) => state.ports.find((port) => port.portId === job.portId)?.rerouteCostPerContainer !== undefined);
+  const estimatedInterventionCost = hasCompleteRerouteCostInputs
+    ? reroutedJobs.reduce((sum, job) => sum + containersFor(job.ship) * state.ports.find((port) => port.portId === job.portId)!.rerouteCostPerContainer!, 0)
+    : null;
   let totalProcessed = 0;
   let nominalCapacity = 0;
   let criticalOnTimeContainers = 0;
@@ -389,6 +430,13 @@ function simulateRun(
           if (criticality) return criticality;
           const deadline = Date.parse(left.item.cargo.deadline) - Date.parse(right.item.cargo.deadline);
           if (deadline) return deadline;
+        } else if (strategy.scheduling === "deadline-risk-first") {
+          const slack = (entry: typeof left) => (Date.parse(entry.item.cargo.deadline) - startMs) / 3_600_000
+            - entry.job.arrivalHour - entry.item.cargo.containers / Math.max(0.01, hourlyCapacity);
+          const slackDifference = slack(left) - slack(right);
+          if (slackDifference) return slackDifference;
+          const criticality = Number(right.item.cargo.essential) - Number(left.item.cargo.essential);
+          if (criticality) return criticality;
         }
         return orderIndex.get(left.job.ship.vesselId)! - orderIndex.get(right.job.ship.vesselId)!
           || left.item.manifestIndex - right.item.manifestIndex;
@@ -399,12 +447,14 @@ function simulateRun(
       factors.capacityCredit = capacityCredit - availableContainers;
       if (!unloading.length) availableContainers = 0;
       let processedThisStep = 0;
-      for (const { job, item } of cargoQueue) {
-        const containersUnloaded = Math.min(availableContainers, item.cargo.containers - item.containersUnloaded);
-        if (containersUnloaded > 0) {
+      const processCargo = (queue: typeof cargoQueue, limit = availableContainers) => {
+        let processed = 0;
+        for (const { job, item } of queue) {
+          const containersUnloaded = Math.min(availableContainers, limit - processed, item.cargo.containers - item.containersUnloaded);
+          if (containersUnloaded <= 0) continue;
           item.containersUnloaded += containersUnloaded;
           availableContainers -= containersUnloaded;
-          processedThisStep += containersUnloaded;
+          processed += containersUnloaded;
           unloadingVesselIds.add(job.ship.vesselId);
           const deadlineHour = (Date.parse(item.cargo.deadline) - startMs) / 3_600_000;
           const delayHours = Math.max(0, endHour - deadlineHour);
@@ -412,8 +462,20 @@ function simulateRun(
           if (item.cargo.essential && endHour <= deadlineHour) criticalOnTimeContainers += containersUnloaded;
           if (hasCompleteCostInputs) estimatedDelayCost += containersUnloaded * delayHours * (item.cargo.delayCostPerContainerHour ?? 0);
           if (item.containersUnloaded === item.cargo.containers) item.completedAtHour = endHour;
+          if (availableContainers === 0 || processed === limit) break;
         }
-        if (availableContainers === 0) break;
+        return processed;
+      };
+      const criticalQueue = cargoQueue.filter(({ item }) => item.cargo.essential);
+      const standardQueue = cargoQueue.filter(({ item }) => !item.cargo.essential);
+      const reservation = strategy.criticalCapacityReservationPercent !== null && criticalQueue.length && standardQueue.length
+        ? Math.floor(availableContainers * strategy.criticalCapacityReservationPercent / 100) : 0;
+      if (reservation > 0) {
+        processedThisStep += processCargo(criticalQueue, reservation);
+        processedThisStep += processCargo(standardQueue);
+        processedThisStep += processCargo(criticalQueue);
+      } else {
+        processedThisStep = processCargo(cargoQueue);
       }
       unloadedByPort.set(port.portId, processedThisStep);
       totalProcessed += processedThisStep;
@@ -449,13 +511,15 @@ function simulateRun(
       portUtilizationPercent: nominalCapacity ? Math.min(100, 100 * totalProcessed / nominalCapacity) : 0,
       delayedVessels,
       estimatedDelayCost: hasCompleteCostInputs ? estimatedDelayCost : null,
+      estimatedInterventionCost,
+      estimatedDisruptionCost: hasCompleteCostInputs && estimatedInterventionCost !== null ? estimatedDelayCost + estimatedInterventionCost : null,
     },
     ...(snapshots ? { snapshots } : {}),
   };
 }
 
 function summarizeTrials(trials: Trial[], options: SimulationOptions): SimulationSummary {
-  const metricKeys: (keyof OutcomeMetrics)[] = ["criticalCargoOnTimePercent", "averageCargoDelayHours", "totalContainersProcessed", "portUtilizationPercent", "delayedVessels", "estimatedDelayCost"];
+  const metricKeys: (keyof OutcomeMetrics)[] = ["criticalCargoOnTimePercent", "averageCargoDelayHours", "totalContainersProcessed", "portUtilizationPercent", "delayedVessels", "estimatedDelayCost", "estimatedInterventionCost", "estimatedDisruptionCost"];
   const mean = Object.fromEntries(metricKeys.map((key) => {
     const values = trials.map((trial) => trial.metrics[key]).filter((value): value is number => value !== null);
     return [key, values.length ? round(values.reduce((sum, value) => sum + value, 0) / values.length) : null];

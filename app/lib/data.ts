@@ -47,7 +47,7 @@ export type ActionId = "critical" | "stagger" | "trucks" | "divert";
 export type Action = { id: ActionId; name: string; detail: string; benefit: string };
 export const ACTIONS: Action[] = [
   { id: "critical", name: "Prioritize critical cargo", detail: "Schedule ships with essential cargo ahead of other vessels.", benefit: "Uses explicit cargo deadlines" },
-  { id: "stagger", name: "Stagger vessel arrivals", detail: "Hold lower-priority vessels for eight hours while essential cargo moves first.", benefit: "Uses modeled vessel arrival holds" },
+  { id: "stagger", name: "Stage selected lower-priority vessels", detail: "Hold eligible vessels for 2, 4, 8, or 12 hours while port resources are constrained.", benefit: "Uses modeled vessel arrival holds" },
   { id: "trucks", name: "Reserve unloading capacity", detail: "Limit concurrent unloading so essential cargo can use a dedicated position.", benefit: "Uses modeled berths and unloading resources" },
   { id: "divert", name: "Divert a standard shipment", detail: "Reroute an eligible nonessential vessel to a modeled alternative port.", benefit: "Only offered for feasible alternative ports" },
 ];

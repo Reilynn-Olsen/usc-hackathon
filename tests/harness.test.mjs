@@ -40,15 +40,30 @@ function cargoOperationsState() {
   state.weather = [];
   return state;
 }
+function objectiveTradeoffState() {
+  const state = cargoOperationsState();
+  state.ships[0].estimatedArrival = startAt;
+  state.ships[1].estimatedArrival = startAt;
+  state.ships[0].cargo[0].deadline = "2026-10-16T13:00:00.000Z";
+  state.ships[0].cargo[0].delayCostPerContainerHour = 100;
+  state.ships[0].cargo[1].deadline = "2026-10-16T15:00:00.000Z";
+  state.ships[0].cargo[1].delayCostPerContainerHour = 0;
+  state.ships[1].cargo[0].deadline = "2026-10-17T12:00:00.000Z";
+  state.ships[1].cargo[0].delayCostPerContainerHour = 100;
+  return state;
+}
 const cargoOperationsOptions = { runs: 1, seed: 42, horizonHours: 18, timeStepHours: 1, maxArrivalDelayHours: 0, weatherSeverityVariation: 0, capacityReductionVariation: 0, unloadingTimeVariation: 0, equipmentFailureProbability: 0 };
-const validReply = (state, strategyId) => ({
+const validReply = (state, strategyId, candidates = generateStrategies(state), selectableIds = candidates.map((strategy) => strategy.id)) => {
+  const selectable = candidates.filter((strategy) => selectableIds.includes(strategy.id));
+  return ({
   model: "test-jev",
-  selection: { choice: strategyId, confidence: 0.8, probabilities: Object.fromEntries(generateStrategies(state).map((strategy) => [strategy.id, strategy.id === strategyId ? 0.8 : 0.2 / (generateStrategies(state).length - 1)])) },
+  selection: { choice: strategyId, confidence: 0.8, probabilities: Object.fromEntries(selectable.map((strategy) => [strategy.id, strategy.id === strategyId ? 0.8 : 0.2 / Math.max(1, selectable.length - 1)])) },
   cargoUrgency: { score: 3, confidence: 0.8, probabilities: { "0": 0, "1": 0.1, "2": 0.2, "3": 0.7 }, legend: { "0": "Low", "1": "Moderate", "2": "High", "3": "Severe" } },
   operationalRisk: { score: 2, confidence: 0.75, probabilities: { "0": 0.1, "1": 0.2, "2": 0.5, "3": 0.2 }, legend: { "0": "Low", "1": "Moderate", "2": "High", "3": "Severe" } },
   humanReview: 0.9,
   timeCritical: 0.95,
-});
+  });
+};
 
 test("synthetic storm state validates and strategies put essential shipments first", () => {
   const state = scenario();
@@ -59,6 +74,69 @@ test("synthetic storm state validates and strategies put essential shipments fir
   const scheduled = criticalFirst.actions.filter((action) => action.type === "schedule").map((action) => action.vesselId);
   assert.deepEqual(scheduled.slice(0, 2), ["pacific-star", "northwind"]);
   assert.ok(strategies.some((strategy) => strategy.id === "dedicated-critical-capacity"));
+});
+
+test("bounded strategy generation offers timed staging for selected vessels and produces different berth states", () => {
+  const state = cargoOperationsState();
+  state.ships[1].estimatedArrival = startAt;
+  state.ports[0].availableBerths = 2;
+  state.ports[0].unloadingResources = 2;
+  const strategies = generateStrategies(state, 18);
+  const staged = strategies.filter((strategy) => Object.keys(strategy.stagingHoursByVessel).length > 0);
+  assert.ok(strategies.length <= 20);
+  assert.deepEqual([2, 4, 8, 12].map((hours) => staged.some((strategy) => Object.values(strategy.stagingHoursByVessel).includes(hours))), [true, true, true, true]);
+  assert.deepEqual(staged.filter((strategy) => strategy.stagingHoursByVessel["vessel-b"] && strategy.scheduling === "critical-first").map((strategy) => strategy.stagingHoursByVessel["vessel-b"]).sort((a, b) => a - b), [2, 4, 8, 12]);
+  assert.ok(staged.some((strategy) => strategy.stagingHoursByVessel["vessel-b"]));
+  assert.ok(strategies.some((strategy) => strategy.scheduling === "deadline-risk-first"));
+
+  const baseline = simulateStrategyWithReplay(state, strategies.find((item) => item.id === "baseline-arrival-order"), cargoOperationsOptions);
+  const stagedPlan = simulateStrategyWithReplay(state, strategies.find((item) => item.id === "stage-vessel-b-2h"), cargoOperationsOptions);
+  assert.equal(baseline.replay.snapshots[1].vessels.find((item) => item.vesselId === "vessel-b").status, "berthed");
+  assert.equal(stagedPlan.replay.snapshots[1].vessels.find((item) => item.vesselId === "vessel-b").status, "waiting");
+});
+
+test("critical throughput reservations change cargo movement without exceeding port throughput", () => {
+  const state = cargoOperationsState();
+  state.ports[0].currentCapacityContainersPerDay = 240;
+  state.ports[0].activeDisruptions[0].severity = 0;
+  state.ports[0].availableBerths = 2;
+  state.ports[0].unloadingResources = 2;
+  state.ships[0].estimatedArrival = startAt;
+  state.ships[0].cargo[0].containers = 10;
+  state.ships[0].cargo[1].containers = 10;
+  state.ships[1].estimatedArrival = startAt;
+  const strategies = generateStrategies(state, 12);
+  assert.deepEqual(strategies.filter((item) => item.criticalCapacityReservationPercent !== null).map((item) => item.criticalCapacityReservationPercent), [25, 50, 75]);
+  const reserved = strategies.find((item) => item.id === "reserve-critical-throughput-50");
+  const result = simulateStrategyWithReplay(state, reserved, { ...cargoOperationsOptions, horizonHours: 12 });
+  const firstHour = result.replay.snapshots.find((item) => item.simulationHour === 1);
+  assert.equal(firstHour.cargoBatches.find((item) => item.batchId === "medical-batch").containersUnloaded, 5);
+  assert.equal(firstHour.cargoBatches.find((item) => item.batchId === "retail-batch").containersUnloaded, 5);
+  assert.equal(firstHour.ports[0].containersUnloadedThisStep, 10);
+});
+
+test("deadline-risk scheduling puts the tighter critical deadline first", () => {
+  const state = cargoOperationsState();
+  state.ships[1].cargo[0].essential = true;
+  state.ships[1].cargo[0].deadline = "2026-10-16T13:00:00.000Z";
+  state.ships[0].cargo[1].deadline = "2026-10-16T16:00:00.000Z";
+  const strategy = generateStrategies(state).find((item) => item.id === "deadline-risk-first");
+  const order = strategy.actions.filter((action) => action.type === "schedule").map((action) => action.vesselId);
+  assert.deepEqual(order.slice(0, 2), ["vessel-b", "vessel-a"]);
+});
+
+test("deadline-risk scheduling helps a congested queue even without essential cargo", () => {
+  const state = cargoOperationsState();
+  state.ships[1].estimatedArrival = startAt;
+  state.ships[0].cargo.forEach((cargo) => { cargo.essential = false; cargo.deadline = "2026-10-17T00:00:00.000Z"; });
+  state.ships[1].cargo[0].deadline = "2026-10-16T13:00:00.000Z";
+  state.ports[0].availableBerths = 2;
+  state.ports[0].unloadingResources = 2;
+  const strategies = generateStrategies(state, 24);
+  const baseline = simulateStrategy(state, strategies.find((item) => item.id === "baseline-arrival-order"), { ...cargoOperationsOptions, horizonHours: 24 });
+  const deadlineRisk = simulateStrategy(state, strategies.find((item) => item.id === "deadline-risk-first"), { ...cargoOperationsOptions, horizonHours: 24 });
+  assert.ok(deadlineRisk.mean.averageCargoDelayHours < baseline.mean.averageCargoDelayHours);
+  assert.ok(deadlineRisk.mean.totalContainersProcessed <= 24);
 });
 
 test("simulated throughput respects port capacity and fixed seed repeats exactly", () => {
@@ -178,14 +256,105 @@ test("standard-shipment rerouting excludes essential vessels and requires a feas
   state.ships[2].eligibleAlternativePortIds = [alternative.portId];
   assert.ok(!generateStrategies(state).some((strategy) => strategy.id === `reroute-northwind-${alternative.portId}`));
   state.ships[0].eligibleAlternativePortIds = [alternative.portId];
-  assert.ok(generateStrategies(state).some((strategy) => strategy.id === `reroute-evergreen-1-${alternative.portId}`));
+  assert.ok(generateStrategies(state).some((strategy) => strategy.id === `reroute-evergreen-1-${alternative.portId}-deadline-risk`));
   alternative.currentCapacityContainersPerDay = 1;
-  assert.ok(!generateStrategies(state).some((strategy) => strategy.id === `reroute-evergreen-1-${alternative.portId}`));
+  assert.ok(!generateStrategies(state).some((strategy) => strategy.id === `reroute-evergreen-1-${alternative.portId}-deadline-risk`));
+});
+
+test("a feasible standard-vessel reroute changes its simulated port assignment", async () => {
+  const state = scenario();
+  const alternative = { ...state.ports[0], portId: "port-alternative", location: { name: "Modeled Alternative", latitude: 34, longitude: -119 }, normalCapacityContainersPerDay: 5000, currentCapacityContainersPerDay: 5000, rerouteCostPerContainer: 15, activeDisruptions: [], queueShipIds: [] };
+  state.ports.push(alternative);
+  state.ports.find((port) => port.portId === state.ships[0].destinationPortId).currentCapacityContainersPerDay = 0;
+  state.ships[0].eligibleAlternativePortIds = [alternative.portId];
+  const strategyId = `reroute-evergreen-1-${alternative.portId}-deadline-risk`;
+  const response = await postSimulation(new Request("http://localhost/api/simulate", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ state, strategyId, options: { runs: 1, seed: 9, horizonHours: 36, maxArrivalDelayHours: 0, capacityReductionVariation: 0, unloadingTimeVariation: 0, weatherSeverityVariation: 0, equipmentFailureProbability: 0 } }),
+  }));
+  const result = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(result.replay.snapshots.at(-1).vessels.find((item) => item.vesselId === "evergreen-1").portId, alternative.portId);
+  assert.equal(result.outcome.mean.estimatedInterventionCost, 160 * alternative.rerouteCostPerContainer);
+  assert.equal(result.outcome.mean.estimatedDisruptionCost, result.outcome.mean.estimatedDelayCost + result.outcome.mean.estimatedInterventionCost);
+  assert.ok(result.outcome.mean.totalContainersProcessed > result.baseline.mean.totalContainersProcessed);
+  assert.deepEqual(result.baselineReplay.snapshots[0].vessels.map((item) => item.portId), state.ships.map((item) => item.destinationPortId));
+});
+
+test("operator objectives select different measured trade-offs and Jev receives an auditable candidate set", async () => {
+  const state = objectiveTradeoffState();
+  const options = { ...cargoOperationsOptions, horizonHours: 24, criticalCargoOnTimeTargetPercent: 0 };
+  const saved = { mock: process.env.JEV_MOCK, nodeEnv: process.env.NODE_ENV };
+  process.env.JEV_MOCK = "true";
+  process.env.NODE_ENV = "test";
+  try {
+    const critical = await createRecommendation(state, options, undefined, { objective: "critical-delivery" });
+    const cost = await createRecommendation(state, options, undefined, { objective: "minimize-cost" });
+    const constrained = await createRecommendation(state, options, undefined, { objective: "critical-delivery", maximumDisruptionCost: 10_000 });
+    assert.equal(critical.recommendation.selectedStrategyId, "critical-cargo-first");
+    assert.equal(cost.recommendation.selectedStrategyId, "baseline-arrival-order");
+    assert.equal(constrained.recommendation.selectedStrategyId, "baseline-arrival-order");
+    assert.ok(critical.recommendation.baselineComparison.selected.mean.criticalCargoOnTimePercent > cost.recommendation.baselineComparison.selected.mean.criticalCargoOnTimePercent);
+    assert.ok(cost.recommendation.baselineComparison.selected.mean.estimatedDelayCost < critical.recommendation.baselineComparison.selected.mean.estimatedDelayCost);
+    assert.equal(critical.recommendation.decisionAudit.objective, "critical-delivery");
+    assert.equal(constrained.recommendation.decisionAudit.maximumDisruptionCost, 10_000);
+  } finally {
+    if (saved.mock === undefined) delete process.env.JEV_MOCK;
+    else process.env.JEV_MOCK = saved.mock;
+    if (saved.nodeEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = saved.nodeEnv;
+  }
+
+  let observed;
+  const jev = await createRecommendation(state, options, async (receivedState, strategies, outcomes, criteria, target, selectableIds) => {
+    observed = { strategies, outcomes, criteria, target, selectableIds };
+    return validReply(receivedState, selectableIds[0], strategies, selectableIds);
+  }, { objective: "minimize-delay", maximumDisruptionCost: 10_000 });
+  assert.equal(observed.criteria.objective, "minimize-delay");
+  assert.equal(observed.target, 0);
+  assert.ok(observed.strategies.every((strategy) => outcomesHaveMetrics(observed.outcomes.get(strategy.id))));
+  assert.ok(observed.selectableIds.every((id) => observed.strategies.some((strategy) => strategy.id === id)));
+  assert.equal(jev.recommendation.decisionAudit.objective, "minimize-delay");
+  assert.deepEqual(jev.recommendation.decisionAudit.candidates.map((candidate) => candidate.strategyId), jev.strategies.map((strategy) => strategy.id));
+  assert.ok(jev.recommendation.decisionAudit.candidates.every((candidate) => candidate.name && candidate.actions.length && outcomesHaveMetrics({ mean: candidate.metrics, probabilityOfMeetingTarget: candidate.probabilityOfMeetingTarget })));
+  assert.deepEqual(jev.recommendation.decisionAudit.candidates.filter((candidate) => candidate.selectionEligible).map((candidate) => candidate.strategyId), observed.selectableIds);
+  assert.equal(jev.recommendation.decisionAudit.fallback, false);
+});
+
+function outcomesHaveMetrics(outcome) {
+  return Number.isFinite(outcome?.mean.averageCargoDelayHours)
+    && Number.isFinite(outcome?.mean.totalContainersProcessed)
+    && typeof outcome?.probabilityOfMeetingTarget === "number";
+}
+
+test("arrival-order baseline remains the recommendation when the recovery actions have no measurable benefit", async () => {
+  const state = scenario();
+  state.ports[0].activeDisruptions = [];
+  state.ports[0].currentCapacityContainersPerDay = 2400;
+  state.ports[0].normalCapacityContainersPerDay = 2400;
+  state.ports[0].availableBerths = 4;
+  state.ports[0].unloadingResources = 4;
+  state.weather = [];
+  for (const ship of state.ships) ship.cargo.forEach((cargo) => { cargo.deadline = "2026-10-22T12:00:00.000Z"; });
+  const saved = { mock: process.env.JEV_MOCK, nodeEnv: process.env.NODE_ENV };
+  process.env.JEV_MOCK = "true";
+  process.env.NODE_ENV = "test";
+  try {
+    const result = await createRecommendation(state, { runs: 1, seed: 1, horizonHours: 36, maxArrivalDelayHours: 0, capacityReductionVariation: 0, unloadingTimeVariation: 0, weatherSeverityVariation: 0, equipmentFailureProbability: 0 });
+    assert.equal(result.recommendation.selectedStrategyId, "baseline-arrival-order");
+    assert.ok(result.strategies.some((strategy) => strategy.id === "baseline-arrival-order"));
+    assert.equal(result.recommendation.decisionAudit.candidates[0].strategyId, "baseline-arrival-order");
+  } finally {
+    if (saved.mock === undefined) delete process.env.JEV_MOCK;
+    else process.env.JEV_MOCK = saved.mock;
+    if (saved.nodeEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = saved.nodeEnv;
+  }
 });
 
 test("invalid Jev choices and Jev failures fall back to normal arrival-order scheduling", async () => {
   const state = scenario();
-  const invalid = await createRecommendation(state, { runs: 3 }, async () => ({ ...validReply(state, "baseline-arrival-order"), selection: { choice: "not-feasible", confidence: 0.99, probabilities: { "not-feasible": 1 } } }));
+  const invalid = await createRecommendation(state, { runs: 3 }, async (_state, strategies, _outcomes, _criteria, _target, ids) => ({ ...validReply(state, ids[0], strategies, ids), selection: { choice: "not-feasible", confidence: 0.99, probabilities: { "not-feasible": 1 } } }));
   assert.equal(invalid.recommendation.selectedStrategyId, "baseline-arrival-order");
   assert.equal(invalid.recommendation.decisionSource, "fallback");
   assert.match(invalid.recommendation.fallbackReason, /outside the feasible candidate set/);
@@ -196,8 +365,8 @@ test("invalid Jev choices and Jev failures fall back to normal arrival-order sch
   assert.equal(failed.recommendation.aiGenerated, false);
   assert.match(failed.recommendation.warnings.join(" "), /Jev decision failed/);
 
-  const incomplete = await createRecommendation(state, { runs: 3 }, async () => {
-    const reply = validReply(state, "baseline-arrival-order");
+  const incomplete = await createRecommendation(state, { runs: 3 }, async (_state, strategies, _outcomes, _criteria, _target, ids) => {
+    const reply = validReply(state, ids[0], strategies, ids);
     delete reply.selection.confidence;
     return reply;
   });
@@ -207,13 +376,13 @@ test("invalid Jev choices and Jev failures fall back to normal arrival-order sch
 
 test("storm example selects a feasible critical-cargo strategy and beats the baseline", async () => {
   const state = scenario();
-  const selectedId = "dedicated-critical-capacity";
-  const result = await createRecommendation(state, { runs: 20, seed: 42 }, async (_state, strategies) => validReply(state, strategies.some((item) => item.id === selectedId) ? selectedId : "baseline-arrival-order"));
+  const selectedId = "critical-cargo-first";
+  const result = await createRecommendation(state, { runs: 20, seed: 42 }, async (_state, strategies, _outcomes, _criteria, _target, ids) => validReply(state, ids.includes(selectedId) ? selectedId : ids[0], strategies, ids));
   assert.ok(result.strategies.some((strategy) => strategy.id === result.recommendation.selectedStrategyId));
   assert.equal(result.recommendation.decisionSource, "jev");
   assert.equal(result.recommendation.aiGenerated, true);
   assert.equal(result.recommendation.jev.model, "test-jev");
-  assert.deepEqual(result.evaluatedStrategies.find((item) => item.strategy.id === selectedId).outcome, result.recommendation.baselineComparison.selected);
+  assert.deepEqual(result.evaluatedStrategies.find((item) => item.strategy.id === result.recommendation.selectedStrategyId).outcome, result.recommendation.baselineComparison.selected);
   assert.ok(result.recommendation.baselineComparison.selected.mean.criticalCargoOnTimePercent > result.recommendation.baselineComparison.baseline.mean.criticalCargoOnTimePercent);
   assert.ok(result.recommendation.baselineComparison.criticalCargoOnTimeChangePercent > 0);
   assert.equal(result.recommendation.humanApprovalRequired, true);
@@ -289,7 +458,7 @@ test("scenario controls produce backend input and action cards reflect feasible 
 test("dense fog recommendation and plan evaluation use the same horizon, seed, and baseline", async () => {
   const fog = configureScenarioState(scenario(), SCENARIOS.find((item) => item.id === "fog"), 35);
   const options = { runs: 8, seed: 42, horizonHours: 36 };
-  const result = await createRecommendation(fog, options, async () => validReply(fog, "stage-lower-priority"));
+  const result = await createRecommendation(fog, options, async (_state, strategies, _outcomes, _criteria, _target, ids) => validReply(fog, strategies.find((item) => ids.includes(item.id) && Object.keys(item.stagingHoursByVessel).length)?.id ?? ids[0], strategies, ids));
   assert.equal(result.recommendation.decisionSource, "jev");
   assert.equal(result.recommendation.estimatedOutcomes.horizonHours, 36);
 
@@ -317,7 +486,7 @@ test("combined recovery actions are validated and use the same seeded baseline s
   const result = await response.json();
   assert.equal(response.status, 200);
   assert.equal(result.strategy.scheduling, "critical-first");
-  assert.equal(result.strategy.holdNonessentialHours, 8);
+  assert.ok(Object.values(result.strategy.stagingHoursByVessel).every((hours) => hours === 8));
   assert.equal(result.strategy.resourceMode, "dedicated-priority");
   assert.equal(result.outcome.runs, options.runs);
   assert.equal(result.outcome.seed, options.seed);
@@ -399,4 +568,20 @@ test("recommendation route returns the complete baseline fallback when Jev has n
     if (saved.nodeEnv === undefined) delete process.env.NODE_ENV;
     else process.env.NODE_ENV = saved.nodeEnv;
   }
+});
+
+test("recommendation route validates operator objectives and cost limits", async () => {
+  const state = scenario();
+  const invalidObjective = await postRecommendation(new Request("http://localhost/api/recommendation", {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ state, decision: { objective: "random" } }),
+  }));
+  const invalidCost = await postRecommendation(new Request("http://localhost/api/recommendation", {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ state, decision: { objective: "minimize-cost", maximumDisruptionCost: -1 } }),
+  }));
+  const invalidRerouteCost = await postStrategies(new Request("http://localhost/api/strategies", {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ state: { ...state, ports: state.ports.map((port) => ({ ...port, rerouteCostPerContainer: -1 })) } }),
+  }));
+  assert.equal(invalidObjective.status, 400);
+  assert.equal(invalidCost.status, 400);
+  assert.equal(invalidRerouteCost.status, 400);
 });

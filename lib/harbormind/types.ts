@@ -27,6 +27,7 @@ export interface Port {
   currentCapacityContainersPerDay: number;
   availableBerths: number;
   unloadingResources: number;
+  rerouteCostPerContainer?: number;
   queueShipIds: string[];
   activeDisruptions: PortDisruption[];
   supportedHandling: string[];
@@ -81,20 +82,29 @@ export interface RecoveryPlanSelection {
   divertStandardShipment: boolean;
 }
 
+export type OptimizationObjective = "critical-delivery" | "minimize-delay" | "minimize-cost" | "balanced";
+
+export interface DecisionCriteria {
+  objective: OptimizationObjective;
+  maximumDisruptionCost?: number;
+}
+
 export type StrategyAction =
   | { type: "schedule"; vesselId: string; portId: string }
   | { type: "prioritize"; vesselIds: string[]; reason: string }
   | { type: "delay"; vesselId: string; hours: number; reason: string }
   | { type: "allocate-resources"; portId: string; concurrentVessels: number }
+  | { type: "reserve-throughput"; criticalPercent: number }
   | { type: "reroute"; vesselId: string; fromPortId: string; toPortId: string };
 
 export interface RecoveryStrategy {
   id: string;
   name: string;
   summary: string;
-  scheduling: "arrival-order" | "critical-first";
+  scheduling: "arrival-order" | "critical-first" | "deadline-risk-first";
   resourceMode: "available" | "dedicated-priority";
-  holdNonessentialHours: number;
+  stagingHoursByVessel: Record<string, number>;
+  criticalCapacityReservationPercent: number | null;
   assignments: Record<string, string>;
   actions: StrategyAction[];
 }
@@ -119,6 +129,8 @@ export interface OutcomeMetrics {
   portUtilizationPercent: number;
   delayedVessels: number;
   estimatedDelayCost: number | null;
+  estimatedInterventionCost: number | null;
+  estimatedDisruptionCost: number | null;
 }
 
 export interface SimulationSummary {
@@ -229,4 +241,20 @@ export interface Recommendation {
   humanApprovalRequired: true;
   dataProvenance: SimulationState["provenance"];
   warnings: string[];
+  decisionAudit: {
+    objective: OptimizationObjective;
+    minimumCriticalCargoOnTimePercent: number;
+    maximumDisruptionCost: number | null;
+    selectedStrategyId: string;
+    fallback: boolean;
+    candidates: Array<{
+      strategyId: string;
+      name: string;
+      actions: StrategyAction[];
+      metrics: OutcomeMetrics;
+      probabilityOfMeetingTarget: number;
+      meetsConstraints: boolean;
+      selectionEligible: boolean;
+    }>;
+  };
 }

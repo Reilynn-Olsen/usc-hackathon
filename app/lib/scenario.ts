@@ -34,8 +34,8 @@ export function snapshotAtHour(replay: SimulationReplay | null | undefined, hour
 
 export function actionSelectionForStrategy(strategy: RecoveryStrategy): ActionState {
   return {
-    critical: strategy.scheduling === "critical-first",
-    stagger: strategy.holdNonessentialHours > 0,
+    critical: strategy.scheduling !== "arrival-order",
+    stagger: Object.keys(strategy.stagingHoursByVessel).length > 0,
     trucks: strategy.resourceMode === "dedicated-priority",
     divert: strategy.actions.some((action) => action.type === "reroute"),
   };
@@ -59,8 +59,8 @@ export function toggleAction(actions: ActionState, id: ActionId, checked: boolea
 
 export function availableActionsForStrategies(strategies: RecoveryStrategy[]): ActionState {
   return {
-    critical: strategies.some((strategy) => strategy.scheduling === "critical-first"),
-    stagger: strategies.some((strategy) => strategy.holdNonessentialHours > 0),
+    critical: strategies.some((strategy) => strategy.scheduling !== "arrival-order"),
+    stagger: strategies.some((strategy) => Object.keys(strategy.stagingHoursByVessel).length > 0),
     trucks: strategies.some((strategy) => strategy.resourceMode === "dedicated-priority"),
     divert: strategies.some((strategy) => strategy.actions.some((action) => action.type === "reroute")),
   };
