@@ -1,4 +1,4 @@
-import type { CargoBatchSnapshot, OperationalSnapshot, OutcomeMetrics, RecoveryPlanSelection, RecoveryStrategy, Ship, SimulationOptions, SimulationReplay, SimulationState, SimulationSummary, StrategyAction } from "./types.ts";
+import type { CargoBatchSnapshot, DecisionCriteria, OperationalSnapshot, OutcomeMetrics, RecoveryPlan, RecoveryStrategy, SchedulingPolicy, Ship, SimulationOptions, SimulationReplay, SimulationState, SimulationSummary, StrategyAction } from "./types.ts";
 
 export const DEFAULT_SIMULATION_OPTIONS: SimulationOptions = {
   runs: 40,
@@ -37,6 +37,10 @@ const containersFor = (ship: Ship) => ship.cargo.reduce((sum, cargo) => sum + ca
 const hasCriticalCargo = (ship: Ship) => ship.cargo.some((cargo) => cargo.essential);
 const isNonessential = (ship: Ship) => ship.cargo.every((cargo) => !cargo.essential);
 
+function arrivalPriority(state: SimulationState, left: Ship, right: Ship): number {
+  return Date.parse(left.estimatedArrival) - Date.parse(right.estimatedArrival) || state.ships.indexOf(left) - state.ships.indexOf(right);
+}
+
 function criticalPriority(state: SimulationState, left: Ship, right: Ship): number {
   const criticalVolume = (ship: Ship) => ship.cargo.reduce((sum, cargo) => sum + (cargo.essential ? cargo.containers : 0), 0);
   const deadline = (ship: Ship) => Math.min(...ship.cargo.filter((cargo) => cargo.essential).map((cargo) => Date.parse(cargo.deadline)), Infinity);
@@ -44,48 +48,93 @@ function criticalPriority(state: SimulationState, left: Ship, right: Ship): numb
   if (deadlineDifference) return deadlineDifference;
   const volumeDifference = criticalVolume(right) - criticalVolume(left);
   if (volumeDifference) return volumeDifference;
-  return Date.parse(left.estimatedArrival) - Date.parse(right.estimatedArrival) || state.ships.indexOf(left) - state.ships.indexOf(right);
+  return arrivalPriority(state, left, right);
 }
 
-function orderFor(state: SimulationState, scheduling: RecoveryStrategy["scheduling"]): Ship[] {
-  return [...state.ships].sort(scheduling === "arrival-order"
-    ? (left, right) => Date.parse(left.estimatedArrival) - Date.parse(right.estimatedArrival) || state.ships.indexOf(left) - state.ships.indexOf(right)
-    : (left, right) => criticalPriority(state, left, right));
+function deadlineSlackHours(state: SimulationState, ship: Ship, portId: string): number {
+  const port = state.ports.find((item) => item.portId === portId);
+  const throughput = Math.max(0.01, (port?.currentCapacityContainersPerDay ?? 0) / 24);
+  const arrivalHour = Math.max(0, (Date.parse(ship.estimatedArrival) - Date.parse(state.startAt)) / 3_600_000);
+  return Math.min(...ship.cargo.map((cargo) => (Date.parse(cargo.deadline) - Date.parse(state.startAt)) / 3_600_000
+    - arrivalHour - cargo.containers / throughput), Infinity);
 }
 
-function orderedIds(state: SimulationState, scheduling: RecoveryStrategy["scheduling"]): string[] {
-  return orderFor(state, scheduling).map((ship) => ship.vesselId);
+function orderFor(state: SimulationState, scheduling: SchedulingPolicy, assignments: Record<string, string>): Ship[] {
+  const comparator = scheduling === "arrival-order" ? (left: Ship, right: Ship) => arrivalPriority(state, left, right)
+    : scheduling === "critical-first" ? (left: Ship, right: Ship) => criticalPriority(state, left, right)
+      : scheduling === "balanced" ? (left: Ship, right: Ship) => {
+        const urgency = (ship: Ship) => deadlineSlackHours(state, ship, assignments[ship.vesselId]) - (hasCriticalCargo(ship) ? 12 : 0);
+        return urgency(left) - urgency(right) || arrivalPriority(state, left, right);
+      }
+        : (left: Ship, right: Ship) => deadlineSlackHours(state, left, assignments[left.vesselId]) - deadlineSlackHours(state, right, assignments[right.vesselId])
+          || Number(hasCriticalCargo(right)) - Number(hasCriticalCargo(left)) || arrivalPriority(state, left, right);
+  return [...state.ships].sort(comparator);
 }
 
-function makeStrategy(
-  state: SimulationState,
-  input: Omit<RecoveryStrategy, "actions">,
-): RecoveryStrategy {
-  const order = orderedIds(state, input.scheduling);
+function planSignature(plan: RecoveryPlan): string {
+  const sorted = (record: Record<string, unknown>) => Object.fromEntries(Object.entries(record).sort(([left], [right]) => left.localeCompare(right)));
+  return JSON.stringify([
+    plan.scheduling, sorted(plan.stagingWindowsByVessel), sorted(plan.cargoPrioritiesByBatch), plan.reserveBerthForCriticalCargo,
+    plan.criticalCapacityReservation, sorted(plan.assignments),
+  ]);
+}
+
+function hash(value: string): string {
+  let result = 2166136261;
+  for (let index = 0; index < value.length; index++) result = Math.imul(result ^ value.charCodeAt(index), 16777619);
+  return (result >>> 0).toString(16).padStart(8, "0");
+}
+
+function makeStrategy(state: SimulationState, plan: RecoveryPlan, name: string, summary: string, id = `plan-${hash(planSignature(plan))}`): RecoveryStrategy {
+  const orderedShips = orderFor(state, plan.scheduling, plan.assignments);
   const actions: StrategyAction[] = [];
-  if (input.scheduling === "critical-first") {
-    actions.push({ type: "prioritize", vesselIds: order.filter((id) => hasCriticalCargo(state.ships.find((ship) => ship.vesselId === id)!)), reason: "Move essential cargo with the earliest deadlines ahead of nonessential freight." });
+  if (plan.scheduling !== "arrival-order") {
+    actions.push({ type: "prioritize", vesselIds: orderedShips.filter(hasCriticalCargo).map((ship) => ship.vesselId), reason: `${plan.scheduling} vessel and cargo scheduling.` });
   }
-  for (const port of state.ports) if (input.resourceMode === "dedicated-priority" && Math.min(port.availableBerths, port.unloadingResources) > 1 && state.ships.some((ship) => input.assignments[ship.vesselId] === port.portId && hasCriticalCargo(ship))) {
-    actions.push({ type: "allocate-resources", portId: port.portId, concurrentVessels: 1 });
+  if (plan.reserveBerthForCriticalCargo) for (const port of state.ports) {
+    if (state.ships.some((ship) => plan.assignments[ship.vesselId] === port.portId && hasCriticalCargo(ship))) actions.push({ type: "allocate-resources", portId: port.portId, concurrentVessels: Math.max(0, Math.min(port.availableBerths, port.unloadingResources) - 1) });
   }
-  for (const ship of orderFor(state, input.scheduling)) {
-    const portId = input.assignments[ship.vesselId];
+  if (plan.criticalCapacityReservation) actions.push({ type: "reserve-throughput", criticalPercent: plan.criticalCapacityReservation.percent, startHour: plan.criticalCapacityReservation.startHour, endHour: plan.criticalCapacityReservation.endHour });
+  for (const [cargoId, priority] of Object.entries(plan.cargoPrioritiesByBatch).sort(([left], [right]) => left.localeCompare(right))) actions.push({ type: "cargo-priority", cargoId, priority });
+  for (const ship of orderedShips) {
+    const portId = plan.assignments[ship.vesselId];
     actions.push({ type: "schedule", vesselId: ship.vesselId, portId });
-    if (input.holdNonessentialHours > 0 && isNonessential(ship)) actions.push({ type: "delay", vesselId: ship.vesselId, hours: input.holdNonessentialHours, reason: "Release constrained unloading capacity for essential cargo." });
+    const staging = plan.stagingWindowsByVessel[ship.vesselId];
+    if (staging) actions.push({ type: "delay", vesselId: ship.vesselId, startHour: staging.startHour, hours: staging.durationHours, reason: "Hold at the arrival point during the configured staging window." });
     if (portId !== ship.destinationPortId) actions.push({ type: "reroute", vesselId: ship.vesselId, fromPortId: ship.destinationPortId, toPortId: portId });
   }
-  return { ...input, actions };
+  return { ...plan, id, name, summary, actions };
 }
 
-function isFeasible(state: SimulationState, strategy: RecoveryStrategy, horizonHours: number): boolean {
-  if (Object.keys(strategy.assignments).length !== state.ships.length) return false;
+function isFeasible(state: SimulationState, plan: RecoveryPlan, horizonHours: number): boolean {
+  const shipIds = new Set(state.ships.map((ship) => ship.vesselId));
+  const cargoIds = new Set(state.ships.flatMap((ship) => ship.cargo.map((cargo) => cargo.cargoId)));
+  if (Object.keys(plan.assignments).length !== state.ships.length || state.ships.some((ship) => !Object.hasOwn(plan.assignments, ship.vesselId))) return false;
+  if (Object.keys(plan.stagingWindowsByVessel).some((id) => !shipIds.has(id)) || Object.entries(plan.stagingWindowsByVessel).some(([vesselId, window]) => {
+    const ship = state.ships.find((item) => item.vesselId === vesselId);
+    return !ship?.cargo.length || !window || !Number.isInteger(window.startHour) || window.startHour < 0
+      || ![2, 4, 8, 12].includes(window.durationHours) || window.startHour + window.durationHours > horizonHours;
+  })) return false;
+  if (Object.keys(plan.cargoPrioritiesByBatch).some((id) => !cargoIds.has(id))
+    || Object.values(plan.cargoPrioritiesByBatch).some((priority) => !Number.isInteger(priority) || priority < 1 || priority > 3)) return false;
+  if (plan.criticalCapacityReservation && (!Number.isInteger(plan.criticalCapacityReservation.percent)
+    || plan.criticalCapacityReservation.percent <= 0 || plan.criticalCapacityReservation.percent >= 100
+    || !Number.isInteger(plan.criticalCapacityReservation.startHour) || plan.criticalCapacityReservation.startHour < 0
+    || !Number.isInteger(plan.criticalCapacityReservation.endHour) || plan.criticalCapacityReservation.endHour <= plan.criticalCapacityReservation.startHour
+    || plan.criticalCapacityReservation.endHour > horizonHours || !state.ships.some(hasCriticalCargo) || !state.ships.some(isNonessential))) return false;
+  if (typeof plan.reserveBerthForCriticalCargo !== "boolean"
+    || (plan.reserveBerthForCriticalCargo && !state.ports.some((port) => Math.min(port.availableBerths, port.unloadingResources) > 1
+      && state.ships.some((ship) => plan.assignments[ship.vesselId] === port.portId && hasCriticalCargo(ship))))) return false;
+  if (!["arrival-order", "critical-first", "deadline-risk-first", "balanced"].includes(plan.scheduling)
+    || !["critical-delivery", "minimize-delay", "minimize-cost", "balanced"].includes(plan.objective)
+    || !Number.isFinite(plan.minimumCriticalCargoOnTimePercent) || plan.minimumCriticalCargoOnTimePercent < 0 || plan.minimumCriticalCargoOnTimePercent > 100
+    || (plan.maximumDisruptionCost !== null && (!Number.isFinite(plan.maximumDisruptionCost) || plan.maximumDisruptionCost < 0))) return false;
   const portLoads = new Map<string, number>();
   for (const ship of state.ships) {
-    const targetId = strategy.assignments[ship.vesselId];
+    const targetId = plan.assignments[ship.vesselId];
     const target = state.ports.find((port) => port.portId === targetId);
     if (!target) return false;
-    if (targetId !== ship.destinationPortId && !ship.eligibleAlternativePortIds.includes(targetId)) return false;
+    if (targetId !== ship.destinationPortId && (hasCriticalCargo(ship) || !ship.eligibleAlternativePortIds.includes(targetId))) return false;
     if (targetId !== ship.destinationPortId && (target.currentCapacityContainersPerDay <= 0 || target.availableBerths < 1 || target.unloadingResources < 1)) return false;
     if (ship.cargo.some((cargo) => cargo.specialHandling.some((need) => !target.supportedHandling.includes(need)))) return false;
     portLoads.set(targetId, (portLoads.get(targetId) ?? 0) + containersFor(ship));
@@ -93,75 +142,166 @@ function isFeasible(state: SimulationState, strategy: RecoveryStrategy, horizonH
   // Only add a reroute when the receiving port can process the modeled queue inside the simulation horizon.
   for (const [portId, load] of portLoads) {
     const port = state.ports.find((item) => item.portId === portId)!;
-    const hasReroute = state.ships.some((ship) => ship.destinationPortId !== strategy.assignments[ship.vesselId] && strategy.assignments[ship.vesselId] === portId);
+    const hasReroute = state.ships.some((ship) => ship.destinationPortId !== plan.assignments[ship.vesselId] && plan.assignments[ship.vesselId] === portId);
     if (hasReroute && load > port.currentCapacityContainersPerDay * horizonHours / 24) return false;
   }
   return true;
 }
 
-export function generateStrategies(state: SimulationState, horizonHours = DEFAULT_SIMULATION_OPTIONS.horizonHours): RecoveryStrategy[] {
-  const assignments = Object.fromEntries(state.ships.map((ship) => [ship.vesselId, ship.destinationPortId]));
-  const candidates = [
-    makeStrategy(state, { id: "baseline-arrival-order", name: "Normal arrival order", summary: "Process vessels in estimated arrival order using available unloading resources.", scheduling: "arrival-order", resourceMode: "available", holdNonessentialHours: 0, assignments }),
-    makeStrategy(state, { id: "critical-cargo-first", name: "Prioritize critical cargo", summary: "Schedule ships carrying essential cargo first, ordered by earliest critical deadline and then cargo volume.", scheduling: "critical-first", resourceMode: "available", holdNonessentialHours: 0, assignments }),
-  ];
-  if (state.ports.some((port) => Math.min(port.availableBerths, port.unloadingResources) > 1)) {
-    candidates.push(makeStrategy(state, { id: "dedicated-critical-capacity", name: "Reserve capacity for critical cargo", summary: "Reserve one berth and unloading resource for essential cargo; downstream landside capacity is not modeled.", scheduling: "critical-first", resourceMode: "dedicated-priority", holdNonessentialHours: 0, assignments }));
+export function isRecoveryPlan(value: unknown): value is RecoveryPlan {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const plan = value as Record<string, unknown>;
+  const keys = ["scheduling", "stagingWindowsByVessel", "cargoPrioritiesByBatch", "reserveBerthForCriticalCargo", "criticalCapacityReservation", "assignments", "objective", "minimumCriticalCargoOnTimePercent", "maximumDisruptionCost"];
+  if (Object.keys(plan).length !== keys.length || keys.some((key) => !Object.hasOwn(plan, key))) return false;
+  if (!plan.stagingWindowsByVessel || typeof plan.stagingWindowsByVessel !== "object" || Array.isArray(plan.stagingWindowsByVessel)
+    || !plan.cargoPrioritiesByBatch || typeof plan.cargoPrioritiesByBatch !== "object" || Array.isArray(plan.cargoPrioritiesByBatch)
+    || !plan.assignments || typeof plan.assignments !== "object" || Array.isArray(plan.assignments)
+    || typeof plan.reserveBerthForCriticalCargo !== "boolean" || typeof plan.minimumCriticalCargoOnTimePercent !== "number"
+    || !Number.isFinite(plan.minimumCriticalCargoOnTimePercent) || plan.minimumCriticalCargoOnTimePercent < 0 || plan.minimumCriticalCargoOnTimePercent > 100
+    || (plan.maximumDisruptionCost !== null && (typeof plan.maximumDisruptionCost !== "number" || !Number.isFinite(plan.maximumDisruptionCost) || plan.maximumDisruptionCost < 0))) return false;
+  if (Object.values(plan.stagingWindowsByVessel as Record<string, unknown>).some((window) => !window || typeof window !== "object" || Array.isArray(window)
+    || Object.keys(window).length !== 2 || !Number.isInteger((window as Record<string, unknown>).startHour) || Number((window as Record<string, unknown>).startHour) < 0
+    || ![2, 4, 8, 12].includes((window as Record<string, unknown>).durationHours as number))) return false;
+  if (Object.values(plan.cargoPrioritiesByBatch as Record<string, unknown>).some((priority) => typeof priority !== "number" || !Number.isInteger(priority) || priority < 1 || priority > 3)) return false;
+  if (Object.values(plan.assignments as Record<string, unknown>).some((portId) => typeof portId !== "string" || !portId)) return false;
+  if (plan.criticalCapacityReservation !== null) {
+    const reservation = plan.criticalCapacityReservation;
+    if (!reservation || typeof reservation !== "object" || Array.isArray(reservation) || Object.keys(reservation).length !== 3
+      || Object.values(reservation).some((item) => typeof item !== "number" || !Number.isFinite(item))
+      || !Number.isInteger((reservation as Record<string, number>).percent) || (reservation as Record<string, number>).percent <= 0 || (reservation as Record<string, number>).percent >= 100
+      || !Number.isInteger((reservation as Record<string, number>).startHour) || (reservation as Record<string, number>).startHour < 0
+      || !Number.isInteger((reservation as Record<string, number>).endHour) || (reservation as Record<string, number>).endHour <= (reservation as Record<string, number>).startHour) return false;
   }
-  if (state.ships.some(isNonessential)) {
-    candidates.push(makeStrategy(state, { id: "stage-lower-priority", name: "Temporarily stage lower-priority ships", summary: "Hold nonessential ships for 8 hours while essential cargo moves first.", scheduling: "critical-first", resourceMode: "available", holdNonessentialHours: 8, assignments }));
-  }
-  const baseCount = candidates.length;
-  const rerouteCandidates = state.ships.filter(isNonessential).flatMap((ship) => ship.eligibleAlternativePortIds.map((portId) => ({ ship, portId })));
-  let feasibleReroutes = 0;
-  for (const { ship, portId } of rerouteCandidates) {
-    const rerouteAssignments = { ...assignments, [ship.vesselId]: portId };
-    const reroute = makeStrategy(state, {
-      id: `reroute-${ship.vesselId}-${portId}`,
-      name: `Reroute ${ship.vesselId} to ${portId}`,
-      summary: `Move ${ship.vesselId} to its explicitly modeled alternative port and retain critical-first scheduling.`,
-      scheduling: "critical-first", resourceMode: "available", holdNonessentialHours: 0, assignments: rerouteAssignments,
-    });
-    if (!isFeasible(state, reroute, horizonHours)) continue;
-    candidates.push(reroute);
-    feasibleReroutes++;
-    // shortcut: show the first 20 feasible reroutes; batch additional candidates when scenarios exceed this limit.
-    if (feasibleReroutes === 20) break;
-  }
-  return candidates.slice(0, baseCount).filter((candidate) => isFeasible(state, candidate, horizonHours)).concat(candidates.slice(baseCount));
+  return ["arrival-order", "critical-first", "deadline-risk-first", "balanced"].includes(plan.scheduling as SchedulingPolicy)
+    && ["critical-delivery", "minimize-delay", "minimize-cost", "balanced"].includes(plan.objective as DecisionCriteria["objective"]);
 }
 
-export function generateStrategyForPlan(state: SimulationState, plan: RecoveryPlanSelection, horizonHours = DEFAULT_SIMULATION_OPTIONS.horizonHours): RecoveryStrategy | undefined {
-  const hasCriticalDemand = state.ships.some(hasCriticalCargo);
-  const hasLowerPriorityShips = state.ships.some(isNonessential);
-  const canReserveCapacity = state.ports.some((port) => Math.min(port.availableBerths, port.unloadingResources) > 1 && state.ships.some((ship) => ship.destinationPortId === port.portId && hasCriticalCargo(ship)));
-  if ((plan.prioritizeCriticalCargo && !hasCriticalDemand)
-    || (plan.staggerLowerPriorityVessels && !hasLowerPriorityShips)
-    || (plan.reserveCapacityForCriticalCargo && (!canReserveCapacity || !plan.prioritizeCriticalCargo))) return undefined;
+export function generateStrategies(
+  state: SimulationState,
+  horizonHours = DEFAULT_SIMULATION_OPTIONS.horizonHours,
+  criteria: DecisionCriteria = { objective: "balanced" },
+  minimumCriticalCargoOnTimePercent = DEFAULT_SIMULATION_OPTIONS.criticalCargoOnTimeTargetPercent,
+): RecoveryStrategy[] {
+  const assignments = Object.fromEntries(state.ships.map((ship) => [ship.vesselId, ship.destinationPortId]));
+  const base: RecoveryPlan = {
+    scheduling: "arrival-order", stagingWindowsByVessel: {}, cargoPrioritiesByBatch: {}, reserveBerthForCriticalCargo: false,
+    criticalCapacityReservation: null, assignments, objective: criteria.objective, minimumCriticalCargoOnTimePercent,
+    maximumDisruptionCost: criteria.maximumDisruptionCost ?? null,
+  };
+  const baseline = makeStrategy(state, base, "Normal arrival order", "Use estimated arrival order with the modeled port's available berths and throughput.", "baseline-arrival-order");
+  const definitions: Array<{ name: string; summary: string; plan: RecoveryPlan }>[] = [];
+  const addFamily = (family: Array<{ name: string; summary: string; plan: RecoveryPlan }>, plan: RecoveryPlan, name: string, summary: string) => {
+    const candidate = makeStrategy(state, plan, name, summary);
+    if (isFeasible(state, plan, horizonHours) && planSignature(candidate) !== planSignature(baseline)) family.push({ name, summary, plan });
+  };
 
-  const defaultAssignments = Object.fromEntries(state.ships.map((ship) => [ship.vesselId, ship.destinationPortId]));
-  const assignments = plan.divertStandardShipment
-    ? state.ships.filter(isNonessential).flatMap((ship) => ship.eligibleAlternativePortIds.map((portId) => ({ ship, portId })))
-    : [{ ship: undefined, portId: undefined }];
-  for (const diversion of assignments) {
-    const nextAssignments = diversion.ship && diversion.portId ? { ...defaultAssignments, [diversion.ship.vesselId]: diversion.portId } : defaultAssignments;
-    const strategy = makeStrategy(state, {
-      id: `custom-${Number(plan.prioritizeCriticalCargo)}${Number(plan.staggerLowerPriorityVessels)}${Number(plan.reserveCapacityForCriticalCargo)}${Number(plan.divertStandardShipment)}${diversion.ship ? `-${diversion.ship.vesselId}-${diversion.portId}` : ""}`,
-      name: plan.divertStandardShipment ? `Divert ${diversion.ship?.vesselId ?? "standard cargo"}` : "Custom recovery plan",
-      summary: [
-        plan.prioritizeCriticalCargo && "schedule essential cargo first",
-        plan.staggerLowerPriorityVessels && "hold lower-priority vessels for 8 hours",
-        plan.reserveCapacityForCriticalCargo && "reserve one berth and unloading resource for essential cargo; downstream landside capacity is not modeled",
-        diversion.ship && `reroute ${diversion.ship.vesselId} to ${diversion.portId}`,
-      ].filter(Boolean).join("; ") || "Process vessels in estimated arrival order using available unloading resources.",
-      scheduling: plan.prioritizeCriticalCargo ? "critical-first" : "arrival-order",
-      resourceMode: plan.reserveCapacityForCriticalCargo ? "dedicated-priority" : "available",
-      holdNonessentialHours: plan.staggerLowerPriorityVessels ? 8 : 0,
-      assignments: nextAssignments,
-    });
-    if (isFeasible(state, strategy, horizonHours)) return strategy;
+  const policies: Array<{ name: string; summary: string; scheduling: SchedulingPolicy }> = [
+    { name: "Critical cargo first", summary: "Schedule essential cargo by earliest deadline, with vessel priority adjusted for its critical volume.", scheduling: "critical-first" },
+    { name: "Deadline risk first", summary: "Schedule the cargo with the least estimated deadline slack first.", scheduling: "deadline-risk-first" },
+    { name: "Balanced scheduling", summary: "Balance essential-cargo urgency against deadline slack and vessel arrival order.", scheduling: "balanced" },
+  ];
+  const policyFamily: Array<{ name: string; summary: string; plan: RecoveryPlan }> = [];
+  for (const policy of policies) addFamily(policyFamily, { ...base, scheduling: policy.scheduling }, policy.name, policy.summary);
+  definitions.push(policyFamily);
+
+  const stagingFamily: Array<{ name: string; summary: string; plan: RecoveryPlan }> = [];
+  // shortcut: cap eligible vessels, cargo batches, and unique disruption windows at eight; expand with a larger candidate budget.
+  const disruptionWindows = [...new Map(
+    state.ports.flatMap((port) => port.activeDisruptions
+      .filter((disruption) => disruption.severity > 0 && disruption.durationHours > 0)
+      .map(({ startHour, durationHours }) => ({ startHour, endHour: Math.min(horizonHours, startHour + durationHours) })))
+      .filter((window) => window.startHour < horizonHours && window.endHour > 0)
+      .sort((left, right) => left.startHour - right.startHour || left.endHour - right.endHour)
+      .map((window) => [JSON.stringify(window), window] as const),
+  ).values()].slice(0, 8);
+  const stagingShips = orderFor(state, "deadline-risk-first", assignments).filter((item) => isNonessential(item) && item.cargo.length > 0).slice(0, 8);
+  for (const durationHours of [2, 4, 8, 12] as const) {
+    for (const ship of stagingShips) {
+      const starts = new Set([0, ...disruptionWindows.map((window) => Math.max(0, Math.min(horizonHours - durationHours, window.endHour - durationHours)))]);
+      for (const startHour of starts) {
+        const stagingWindowsByVessel = { [ship.vesselId]: { startHour, durationHours } };
+        addFamily(stagingFamily, { ...base, scheduling: "critical-first", stagingWindowsByVessel }, `Stage ${ship.vesselId} for ${durationHours}h`, `Hold ${ship.vesselId} for ${durationHours} hours from T+${startHour}h, then use critical-first scheduling.`);
+      }
+    }
   }
-  return undefined;
+  definitions.push(stagingFamily);
+
+  const throughputFamily: Array<{ name: string; summary: string; plan: RecoveryPlan }> = [];
+  if (state.ships.some(hasCriticalCargo) && state.ships.some(isNonessential)) {
+    const windows = [{ startHour: 0, endHour: horizonHours }, ...disruptionWindows.map((window) => ({ startHour: window.startHour, endHour: Math.min(horizonHours, window.endHour) }))];
+    const uniqueWindows = [...new Map(windows.filter((window) => window.endHour > window.startHour).map((window) => [JSON.stringify(window), window])).values()];
+    for (const window of uniqueWindows) for (const percent of [25, 50, 75]) {
+      const reservation = { percent, ...window };
+      addFamily(throughputFamily, { ...base, scheduling: "deadline-risk-first", criticalCapacityReservation: reservation }, `${percent}% critical throughput reservation`, `Reserve ${percent}% of port throughput for critical cargo from T+${window.startHour}h to T+${window.endHour}h.`);
+    }
+  }
+  definitions.push(throughputFamily);
+
+  const priorityFamily: Array<{ name: string; summary: string; plan: RecoveryPlan }> = [];
+  const priorityBatches = state.ships.flatMap((ship) => ship.cargo.filter((batch) => !batch.essential).map((batch) => ({ ship, batch })))
+    .sort((left, right) => Date.parse(left.batch.deadline) - Date.parse(right.batch.deadline) || arrivalPriority(state, left.ship, right.ship))
+    .slice(0, 8);
+  for (const { batch: cargo } of priorityBatches) {
+    for (const priority of [1, 2, 3] as const) {
+      const cargoPrioritiesByBatch = { [cargo.cargoId]: priority };
+      addFamily(priorityFamily, { ...base, scheduling: "balanced", cargoPrioritiesByBatch }, `Raise ${cargo.cargoId} priority to ${priority}`, `Move cargo batch ${cargo.cargoId} ahead using priority level ${priority} (higher values unload first).`);
+    }
+  }
+  definitions.push(priorityFamily);
+
+  const rerouteFamily: Array<{ name: string; summary: string; plan: RecoveryPlan }> = [];
+  const rerouteShips = orderFor(state, "deadline-risk-first", assignments).filter((item) => isNonessential(item) && item.cargo.length > 0).slice(0, 8);
+  for (const ship of rerouteShips) for (const portId of ship.eligibleAlternativePortIds) {
+    const plan = { ...base, scheduling: "deadline-risk-first" as const, assignments: { ...assignments, [ship.vesselId]: portId } };
+    addFamily(rerouteFamily, plan, `Reroute ${ship.vesselId} to ${portId}`, `Assign ${ship.vesselId} to its modeled alternative port and schedule by deadline risk.`);
+  }
+  definitions.push(rerouteFamily);
+
+  const combinedFamily: Array<{ name: string; summary: string; plan: RecoveryPlan }> = [];
+  const stageSeeds = stagingFamily.slice(0, 4);
+  for (const item of stageSeeds) addFamily(combinedFamily, { ...item.plan, reserveBerthForCriticalCargo: true }, `${item.name} with a protected berth`, `${item.summary} Keep one eligible berth for a vessel carrying critical cargo.`);
+  for (const item of rerouteFamily.slice(0, 4)) addFamily(combinedFamily, { ...item.plan, scheduling: "critical-first" }, `${item.name} with critical-first scheduling`, `${item.summary} Schedule essential cargo first at each port.`);
+  for (const item of throughputFamily.slice(0, 3)) {
+    const priorityCargo = state.ships.flatMap((ship) => ship.cargo).find((cargo) => !cargo.essential);
+    addFamily(combinedFamily, { ...item.plan, scheduling: "balanced", ...(priorityCargo ? { cargoPrioritiesByBatch: { [priorityCargo.cargoId]: 2 } } : {}) }, `${item.name} with balanced scheduling`, `${item.summary} Balance deadline risk and vessel arrival order.`);
+  }
+  definitions.push(combinedFamily);
+
+  // Round-robin strategy families so staging or priorities cannot crowd reroutes and combined plans out of the evaluation budget.
+  const candidates = [baseline];
+  const signatures = new Set([planSignature(baseline)]);
+  for (let index = 0; candidates.length < 40; index++) {
+    let found = false;
+    for (const family of definitions) {
+      const item = family[index];
+      if (!item) continue;
+      found = true;
+      const signature = planSignature(item.plan);
+      if (!signatures.has(signature)) {
+        signatures.add(signature);
+        candidates.push(makeStrategy(state, item.plan, item.name, item.summary));
+        if (candidates.length === 40) break;
+      }
+    }
+    if (!found) break;
+  }
+  return candidates;
+}
+
+export function generateStrategyForPlan(state: SimulationState, value: unknown, horizonHours = DEFAULT_SIMULATION_OPTIONS.horizonHours): RecoveryStrategy | undefined {
+  if (!isRecoveryPlan(value) || !isFeasible(state, value, horizonHours)) return undefined;
+  const plan = value;
+  const namedAssignments = Object.entries(plan.assignments).filter(([vesselId, portId]) => state.ships.find((ship) => ship.vesselId === vesselId)?.destinationPortId !== portId);
+  const name = namedAssignments.length ? namedAssignments.map(([vesselId, portId]) => `Reroute ${vesselId} to ${portId}`).join(" · ") : "Custom recovery plan";
+  const changes = [
+    plan.scheduling !== "arrival-order" && `${plan.scheduling} scheduling`,
+    ...Object.entries(plan.stagingWindowsByVessel).map(([vesselId, window]) => `stage ${vesselId} ${window.durationHours}h from T+${window.startHour}h`),
+    ...Object.keys(plan.cargoPrioritiesByBatch).map((cargoId) => `raise ${cargoId} priority`),
+    plan.reserveBerthForCriticalCargo && "reserve a berth for critical cargo",
+    plan.criticalCapacityReservation && `reserve ${plan.criticalCapacityReservation.percent}% throughput during T+${plan.criticalCapacityReservation.startHour}–${plan.criticalCapacityReservation.endHour}h`,
+    ...namedAssignments.map(([vesselId, portId]) => `reroute ${vesselId} to ${portId}`),
+  ].filter(Boolean);
+  return makeStrategy(state, plan, name, changes.join("; ") || "Process vessels in estimated arrival order with available port capacity.");
 }
 
 interface CargoJob {
@@ -186,6 +326,7 @@ interface VesselJob {
 interface Trial {
   metrics: OutcomeMetrics;
   snapshots?: OperationalSnapshot[];
+  checkpoint?: SimulationCheckpoint;
 }
 
 interface PortFactors {
@@ -194,6 +335,19 @@ interface PortFactors {
   weatherVariation: number;
   availableUnloadingResources: number;
   capacityCredit: number;
+}
+
+export interface SimulationCheckpoint {
+  hour: number;
+  nextStepIndex: number;
+  jobs: VesselJob[];
+  portFactors: Map<string, PortFactors>;
+  totalProcessed: number;
+  nominalCapacity: number;
+  criticalOnTimeContainers: number;
+  delayContainerHours: number;
+  estimatedDelayCost: number;
+  snapshots?: OperationalSnapshot[];
 }
 
 function seededRandom(seed: number): () => number {
@@ -251,17 +405,32 @@ function simulateRun(
   options: SimulationOptions,
   random: () => number,
   captureReplay = false,
+  stopAtHour?: number,
+  resume?: SimulationCheckpoint,
+  continueCurrentPlan = false,
 ): Trial {
   const startMs = Date.parse(state.startAt);
-  const order = orderedIds(state, strategy.scheduling);
+  const activeStrategy = resume && !continueCurrentPlan ? {
+    ...strategy,
+    stagingWindowsByVessel: Object.fromEntries(Object.entries(strategy.stagingWindowsByVessel).map(([id, window]) => [id, { ...window, startHour: window.startHour + resume.hour }])),
+    criticalCapacityReservation: strategy.criticalCapacityReservation ? {
+      ...strategy.criticalCapacityReservation,
+      startHour: strategy.criticalCapacityReservation.startHour + resume.hour,
+      endHour: strategy.criticalCapacityReservation.endHour + resume.hour,
+    } : null,
+  } : strategy;
+  const order = resume
+    ? activeStrategy.actions.filter((action) => action.type === "schedule").map((action) => action.vesselId)
+    : orderFor(state, activeStrategy.scheduling, activeStrategy.assignments).map((ship) => ship.vesselId);
   const orderIndex = new Map(order.map((vesselId, index) => [vesselId, index]));
-  const jobs: VesselJob[] = state.ships.map((ship) => {
+  const jobs: VesselJob[] = resume ? resume.jobs.map((job) => ({ ...job, cargo: job.cargo.map((item) => ({ ...item })) })) : state.ships.map((ship) => {
     const arrivalHour = Math.max(0, (Date.parse(ship.estimatedArrival) - startMs) / 3_600_000 + random() * options.maxArrivalDelayHours);
+    const staging = activeStrategy.stagingWindowsByVessel[ship.vesselId];
     return {
       ship,
       portId: strategy.assignments[ship.vesselId],
       arrivalHour,
-      eligibleHour: arrivalHour + (isNonessential(ship) ? strategy.holdNonessentialHours : 0),
+      eligibleHour: staging ? Math.max(arrivalHour, staging.startHour) + staging.durationHours : arrivalHour,
       status: "scheduled",
       berthId: null,
       berthAtHour: null,
@@ -269,7 +438,7 @@ function simulateRun(
       cargo: ship.cargo.map((cargo, manifestIndex) => ({ cargo, manifestIndex, containersUnloaded: 0, completedAtHour: null })),
     };
   });
-  const portFactors = new Map<string, PortFactors>(state.ports.map((port): [string, PortFactors] => {
+  const portFactors = resume ? new Map([...resume.portFactors].map(([id, factors]) => [id, { ...factors }])) : new Map<string, PortFactors>(state.ports.map((port): [string, PortFactors] => {
     const capacityFactor = 1 - random() * options.capacityReductionVariation;
     const unloadingFactor = 1 + random() * options.unloadingTimeVariation;
     const weatherVariation = (random() * 2 - 1) * options.weatherSeverityVariation;
@@ -277,16 +446,27 @@ function simulateRun(
     const availableUnloadingResources = Math.max(0, port.unloadingResources - (resourceFailure ? 1 : 0));
     return [port.portId, { capacityFactor, unloadingFactor, weatherVariation, availableUnloadingResources, capacityCredit: 0 }];
   }));
+  if (resume) for (const job of jobs) {
+    if (job.status === "departed" || job.berthId) continue;
+    if (activeStrategy.assignments[job.ship.vesselId]) job.portId = activeStrategy.assignments[job.ship.vesselId];
+    const staging = activeStrategy.stagingWindowsByVessel[job.ship.vesselId];
+    if (!continueCurrentPlan) job.eligibleHour = staging ? Math.max(job.arrivalHour, staging.startHour) + staging.durationHours : job.arrivalHour;
+  }
   const allCargo = jobs.flatMap((job) => job.cargo);
   const criticalContainerCount = allCargo.reduce((sum, item) => sum + (item.cargo.essential ? item.cargo.containers : 0), 0);
   const totalCargoContainers = allCargo.reduce((sum, item) => sum + item.cargo.containers, 0);
   const hasCompleteCostInputs = allCargo.length > 0 && allCargo.every((item) => item.cargo.delayCostPerContainerHour !== undefined);
-  let totalProcessed = 0;
-  let nominalCapacity = 0;
-  let criticalOnTimeContainers = 0;
-  let delayContainerHours = 0;
-  let estimatedDelayCost = 0;
-  const snapshots: OperationalSnapshot[] | undefined = captureReplay ? [] : undefined;
+  const reroutedJobs = jobs.filter((job) => job.portId !== job.ship.destinationPortId);
+  const hasCompleteRerouteCostInputs = reroutedJobs.every((job) => state.ports.find((port) => port.portId === job.portId)?.rerouteCostPerContainer !== undefined);
+  const estimatedInterventionCost = hasCompleteRerouteCostInputs
+    ? reroutedJobs.reduce((sum, job) => sum + containersFor(job.ship) * state.ports.find((port) => port.portId === job.portId)!.rerouteCostPerContainer!, 0)
+    : null;
+  let totalProcessed = resume?.totalProcessed ?? 0;
+  let nominalCapacity = resume?.nominalCapacity ?? 0;
+  let criticalOnTimeContainers = resume?.criticalOnTimeContainers ?? 0;
+  let delayContainerHours = resume?.delayContainerHours ?? 0;
+  let estimatedDelayCost = resume?.estimatedDelayCost ?? 0;
+  const snapshots: OperationalSnapshot[] | undefined = captureReplay || resume?.snapshots ? [...(resume?.snapshots ?? [])] : undefined;
   const totalStepCount = Math.ceil(options.horizonHours / options.timeStepHours);
 
   const activeDisruptionsAt = (port: SimulationState["ports"][number], hour: number) => port.activeDisruptions
@@ -337,10 +517,12 @@ function simulateRun(
     for (const job of jobs) if (job.status === "scheduled" && job.arrivalHour <= hour) job.status = "waiting";
   };
 
-  updateArrivals(0);
-  captureSnapshot(0, new Map(), new Set());
+  if (!resume) {
+    updateArrivals(0);
+    captureSnapshot(0, new Map(), new Set());
+  }
 
-  for (let stepIndex = 0; stepIndex < totalStepCount; stepIndex++) {
+  for (let stepIndex = resume?.nextStepIndex ?? 0; stepIndex < totalStepCount; stepIndex++) {
     const startHour = stepIndex * options.timeStepHours;
     const endHour = Math.min(options.horizonHours, startHour + options.timeStepHours);
     const elapsedHours = endHour - startHour;
@@ -357,7 +539,7 @@ function simulateRun(
       const portJobs = jobs.filter((job) => job.portId === port.portId);
       const freeBerthIds = Array.from({ length: Math.max(0, port.availableBerths) }, (_, index) => `${port.portId}-berth-${index + 1}`)
         .filter((berthId) => !portJobs.some((job) => job.berthId === berthId));
-      const criticalPending = strategy.resourceMode === "dedicated-priority" && portJobs.some((job) => job.status !== "departed" && hasRemainingCriticalCargo(job));
+      const criticalPending = activeStrategy.reserveBerthForCriticalCargo && portJobs.some((job) => job.status !== "departed" && hasRemainingCriticalCargo(job));
       const criticalAlreadyBerthed = portJobs.some((job) => job.status === "berthed" && hasRemainingCriticalCargo(job));
       const reserveCriticalBerth = criticalPending && !criticalAlreadyBerthed;
       const noncriticalBerthLimit = reserveCriticalBerth ? Math.max(0, port.availableBerths - 1) : port.availableBerths;
@@ -378,17 +560,27 @@ function simulateRun(
         .sort((left, right) => orderIndex.get(left.ship.vesselId)! - orderIndex.get(right.ship.vesselId)!);
       const criticalBerthed = berthed.filter(hasRemainingCriticalCargo);
       const unloadingSlots = Math.min(factors.availableUnloadingResources, port.availableBerths);
-      const unloading = unloadingSlots > 0 && strategy.resourceMode === "dedicated-priority" && criticalBerthed.length
+      const unloading = unloadingSlots > 0 && activeStrategy.reserveBerthForCriticalCargo && criticalBerthed.length
         ? [...criticalBerthed.slice(0, 1), ...berthed.filter((job) => job !== criticalBerthed[0]).slice(0, Math.max(0, unloadingSlots - 1))]
         : berthed.slice(0, unloadingSlots);
 
       const cargoQueue = unloading.flatMap((job) => job.cargo.filter((item) => item.containersUnloaded < item.cargo.containers).map((item) => ({ job, item })));
       cargoQueue.sort((left, right) => {
-        if (strategy.scheduling === "critical-first") {
+        const explicitPriority = (activeStrategy.cargoPrioritiesByBatch[right.item.cargo.cargoId] ?? 0) - (activeStrategy.cargoPrioritiesByBatch[left.item.cargo.cargoId] ?? 0);
+        if (explicitPriority) return explicitPriority;
+        if (activeStrategy.scheduling === "critical-first") {
           const criticality = Number(right.item.cargo.essential) - Number(left.item.cargo.essential);
           if (criticality) return criticality;
           const deadline = Date.parse(left.item.cargo.deadline) - Date.parse(right.item.cargo.deadline);
           if (deadline) return deadline;
+        } else if (activeStrategy.scheduling === "deadline-risk-first" || activeStrategy.scheduling === "balanced") {
+          const slack = (entry: typeof left) => (Date.parse(entry.item.cargo.deadline) - startMs) / 3_600_000
+            - entry.job.arrivalHour - entry.item.cargo.containers / Math.max(0.01, hourlyCapacity);
+          const risk = (entry: typeof left) => slack(entry) - (activeStrategy.scheduling === "balanced" && entry.item.cargo.essential ? 12 : 0);
+          const slackDifference = risk(left) - risk(right);
+          if (slackDifference) return slackDifference;
+          const criticality = Number(right.item.cargo.essential) - Number(left.item.cargo.essential);
+          if (criticality) return criticality;
         }
         return orderIndex.get(left.job.ship.vesselId)! - orderIndex.get(right.job.ship.vesselId)!
           || left.item.manifestIndex - right.item.manifestIndex;
@@ -399,12 +591,14 @@ function simulateRun(
       factors.capacityCredit = capacityCredit - availableContainers;
       if (!unloading.length) availableContainers = 0;
       let processedThisStep = 0;
-      for (const { job, item } of cargoQueue) {
-        const containersUnloaded = Math.min(availableContainers, item.cargo.containers - item.containersUnloaded);
-        if (containersUnloaded > 0) {
+      const processCargo = (queue: typeof cargoQueue, limit = availableContainers) => {
+        let processed = 0;
+        for (const { job, item } of queue) {
+          const containersUnloaded = Math.min(availableContainers, limit - processed, item.cargo.containers - item.containersUnloaded);
+          if (containersUnloaded <= 0) continue;
           item.containersUnloaded += containersUnloaded;
           availableContainers -= containersUnloaded;
-          processedThisStep += containersUnloaded;
+          processed += containersUnloaded;
           unloadingVesselIds.add(job.ship.vesselId);
           const deadlineHour = (Date.parse(item.cargo.deadline) - startMs) / 3_600_000;
           const delayHours = Math.max(0, endHour - deadlineHour);
@@ -412,8 +606,23 @@ function simulateRun(
           if (item.cargo.essential && endHour <= deadlineHour) criticalOnTimeContainers += containersUnloaded;
           if (hasCompleteCostInputs) estimatedDelayCost += containersUnloaded * delayHours * (item.cargo.delayCostPerContainerHour ?? 0);
           if (item.containersUnloaded === item.cargo.containers) item.completedAtHour = endHour;
+          if (availableContainers === 0 || processed === limit) break;
         }
-        if (availableContainers === 0) break;
+        return processed;
+      };
+      const criticalQueue = cargoQueue.filter(({ item }) => item.cargo.essential);
+      const standardQueue = cargoQueue.filter(({ item }) => !item.cargo.essential);
+      const reservationWindow = activeStrategy.criticalCapacityReservation;
+      const reservationHours = reservationWindow
+        ? Math.max(0, Math.min(endHour, reservationWindow.endHour) - Math.max(startHour, reservationWindow.startHour)) : 0;
+      const reservation = reservationWindow && reservationHours > 0 && elapsedHours && criticalQueue.length && standardQueue.length
+        ? Math.floor(availableContainers * reservationWindow.percent / 100 * reservationHours / elapsedHours) : 0;
+      if (reservation > 0) {
+        processedThisStep += processCargo(criticalQueue, reservation);
+        processedThisStep += processCargo(standardQueue);
+        processedThisStep += processCargo(criticalQueue);
+      } else {
+        processedThisStep = processCargo(cargoQueue);
       }
       unloadedByPort.set(port.portId, processedThisStep);
       totalProcessed += processedThisStep;
@@ -430,6 +639,31 @@ function simulateRun(
 
     updateArrivals(endHour);
     captureSnapshot(endHour, unloadedByPort, unloadingVesselIds);
+    if (stopAtHour !== undefined && endHour >= stopAtHour) return {
+      metrics: {
+        criticalCargoOnTimePercent: criticalContainerCount ? 100 * criticalOnTimeContainers / criticalContainerCount : 100,
+        averageCargoDelayHours: totalCargoContainers ? delayContainerHours / totalCargoContainers : 0,
+        totalContainersProcessed: totalProcessed,
+        portUtilizationPercent: nominalCapacity ? Math.min(100, 100 * totalProcessed / nominalCapacity) : 0,
+        delayedVessels: 0,
+        estimatedDelayCost: hasCompleteCostInputs ? estimatedDelayCost : null,
+        estimatedInterventionCost,
+        estimatedDisruptionCost: hasCompleteCostInputs && estimatedInterventionCost !== null ? estimatedDelayCost + estimatedInterventionCost : null,
+      },
+      ...(snapshots ? { snapshots } : {}),
+      checkpoint: {
+        hour: endHour,
+        nextStepIndex: stepIndex + 1,
+        jobs: jobs.map((job) => ({ ...job, cargo: job.cargo.map((item) => ({ ...item })) })),
+        portFactors: new Map([...portFactors].map(([id, factors]) => [id, { ...factors }])),
+        totalProcessed,
+        nominalCapacity,
+        criticalOnTimeContainers,
+        delayContainerHours,
+        estimatedDelayCost,
+        ...(snapshots ? { snapshots: [...snapshots] } : {}),
+      },
+    };
   }
 
   const delayedVessels = jobs.filter((job) => job.arrivalHour <= options.horizonHours
@@ -449,13 +683,15 @@ function simulateRun(
       portUtilizationPercent: nominalCapacity ? Math.min(100, 100 * totalProcessed / nominalCapacity) : 0,
       delayedVessels,
       estimatedDelayCost: hasCompleteCostInputs ? estimatedDelayCost : null,
+      estimatedInterventionCost,
+      estimatedDisruptionCost: hasCompleteCostInputs && estimatedInterventionCost !== null ? estimatedDelayCost + estimatedInterventionCost : null,
     },
     ...(snapshots ? { snapshots } : {}),
   };
 }
 
 function summarizeTrials(trials: Trial[], options: SimulationOptions): SimulationSummary {
-  const metricKeys: (keyof OutcomeMetrics)[] = ["criticalCargoOnTimePercent", "averageCargoDelayHours", "totalContainersProcessed", "portUtilizationPercent", "delayedVessels", "estimatedDelayCost"];
+  const metricKeys: (keyof OutcomeMetrics)[] = ["criticalCargoOnTimePercent", "averageCargoDelayHours", "totalContainersProcessed", "portUtilizationPercent", "delayedVessels", "estimatedDelayCost", "estimatedInterventionCost", "estimatedDisruptionCost"];
   const mean = Object.fromEntries(metricKeys.map((key) => {
     const values = trials.map((trial) => trial.metrics[key]).filter((value): value is number => value !== null);
     return [key, values.length ? round(values.reduce((sum, value) => sum + value, 0) / values.length) : null];
@@ -483,6 +719,86 @@ export function simulateStrategyWithReplay(state: SimulationState, strategy: Rec
   const options = { ...DEFAULT_SIMULATION_OPTIONS, ...partialOptions };
   const random = seededRandom(options.seed);
   const trials = Array.from({ length: options.runs }, (_, index) => simulateRun(state, strategy, options, random, index === 0));
+  return {
+    summary: summarizeTrials(trials, options),
+    replay: { seed: options.seed, sampleRunIndex: 0, timeStepHours: options.timeStepHours, snapshots: trials[0].snapshots ?? [] },
+  };
+}
+
+export function simulateToCheckpoint(state: SimulationState, strategy: RecoveryStrategy, partialOptions: Partial<SimulationOptions>, hour: number): SimulationCheckpoint {
+  const options = { ...DEFAULT_SIMULATION_OPTIONS, ...partialOptions };
+  if (!Number.isInteger(hour) || hour <= 0 || hour >= options.horizonHours || hour % options.timeStepHours !== 0) throw new Error("Replanning hour must be inside the horizon and align with the simulation time step.");
+  const trial = simulateRun(state, strategy, options, seededRandom(options.seed), true, hour);
+  if (!trial.checkpoint) throw new Error("Simulation did not reach the replanning checkpoint.");
+  return trial.checkpoint;
+}
+
+export function remainingStateAtCheckpoint(state: SimulationState, checkpoint: SimulationCheckpoint): SimulationState {
+  const startAt = new Date(Date.parse(state.startAt) + checkpoint.hour * 3_600_000).toISOString();
+  const jobs = checkpoint.jobs.filter((job) => job.status !== "departed" && hasRemainingCargo(job));
+  return {
+    ...state,
+    scenarioId: `${state.scenarioId}-replan-${checkpoint.hour}`,
+    startAt,
+    ports: state.ports.map((port) => ({
+      ...port,
+      availableBerths: Math.max(0, port.availableBerths - jobs.filter((job) => job.portId === port.portId && job.status === "berthed").length),
+      unloadingResources: Math.max(0, port.unloadingResources - jobs.filter((job) => job.portId === port.portId && job.status === "berthed").length),
+      queueShipIds: jobs.filter((job) => job.portId === port.portId).map((job) => job.ship.vesselId),
+      activeDisruptions: port.activeDisruptions.flatMap((disruption) => {
+        const endHour = disruption.startHour + disruption.durationHours;
+        if (endHour <= checkpoint.hour) return [];
+        const activeStart = Math.max(checkpoint.hour, disruption.startHour);
+        return [{ ...disruption, startHour: activeStart - checkpoint.hour, durationHours: endHour - activeStart }];
+      }),
+    })),
+    ships: jobs.map((job) => ({
+      ...job.ship,
+      destinationPortId: job.portId,
+      estimatedArrival: job.status === "scheduled"
+        ? new Date(Date.parse(state.startAt) + Math.max(checkpoint.hour, job.arrivalHour) * 3_600_000).toISOString()
+        : startAt,
+      eligibleAlternativePortIds: job.status === "scheduled" && job.portId === job.ship.destinationPortId
+        ? job.ship.eligibleAlternativePortIds.filter((id) => id !== job.portId) : [],
+      cargo: job.cargo.filter((item) => item.containersUnloaded < item.cargo.containers).map((item) => ({
+        ...item.cargo,
+        containers: item.cargo.containers - item.containersUnloaded,
+      })),
+    })),
+    weather: state.weather.map((weather) => ({
+      ...weather,
+      forecasts: weather.forecasts.filter((point) => Date.parse(point.at) >= Date.parse(startAt)),
+    })),
+  };
+}
+
+export function simulateFromCheckpoint(state: SimulationState, strategy: RecoveryStrategy, partialOptions: Partial<SimulationOptions>, checkpoint: SimulationCheckpoint, continueCurrentPlan = false): { summary: SimulationSummary; replay: SimulationReplay } {
+  const options = { ...DEFAULT_SIMULATION_OPTIONS, ...partialOptions };
+  const trial = simulateRun(state, strategy, options, seededRandom(options.seed), true, undefined, checkpoint, continueCurrentPlan);
+  const summary = summarizeTrials([trial], { ...options, runs: 1 });
+  return {
+    summary,
+    replay: { seed: options.seed, sampleRunIndex: 0, timeStepHours: options.timeStepHours, snapshots: trial.snapshots ?? [] },
+  };
+}
+
+export function simulateAdaptiveStrategyWithReplay(
+  state: SimulationState,
+  initialStrategy: RecoveryStrategy,
+  adaptiveStrategy: RecoveryStrategy,
+  partialOptions: Partial<SimulationOptions>,
+  replanHour: number,
+  firstCheckpoint?: SimulationCheckpoint,
+  continueCurrentPlan = false,
+): { summary: SimulationSummary; replay: SimulationReplay } {
+  const options = { ...DEFAULT_SIMULATION_OPTIONS, ...partialOptions };
+  const random = seededRandom(options.seed);
+  if (firstCheckpoint) for (let draw = 0; draw < state.ships.length + state.ports.length * 4; draw++) random();
+  const trials = Array.from({ length: options.runs }, (_, index) => {
+    const checkpoint = index === 0 && firstCheckpoint ? firstCheckpoint : simulateRun(state, initialStrategy, options, random, index === 0, replanHour).checkpoint;
+    if (!checkpoint) throw new Error("Simulation did not reach the replanning checkpoint.");
+    return simulateRun(state, adaptiveStrategy, options, random, index === 0, undefined, checkpoint, continueCurrentPlan);
+  });
   return {
     summary: summarizeTrials(trials, options),
     replay: { seed: options.seed, sampleRunIndex: 0, timeStepHours: options.timeStepHours, snapshots: trials[0].snapshots ?? [] },

@@ -27,6 +27,7 @@ export interface Port {
   currentCapacityContainersPerDay: number;
   availableBerths: number;
   unloadingResources: number;
+  rerouteCostPerContainer?: number;
   queueShipIds: string[];
   activeDisruptions: PortDisruption[];
   supportedHandling: string[];
@@ -74,28 +75,53 @@ export interface SimulationState {
   };
 }
 
-export interface RecoveryPlanSelection {
-  prioritizeCriticalCargo: boolean;
-  staggerLowerPriorityVessels: boolean;
-  reserveCapacityForCriticalCargo: boolean;
-  divertStandardShipment: boolean;
+export type OptimizationObjective = "critical-delivery" | "minimize-delay" | "minimize-cost" | "balanced";
+
+export interface DecisionCriteria {
+  objective: OptimizationObjective;
+  maximumDisruptionCost?: number;
+}
+
+export type SchedulingPolicy = "arrival-order" | "critical-first" | "deadline-risk-first" | "balanced";
+
+export interface VesselStagingWindow {
+  startHour: number;
+  durationHours: 2 | 4 | 8 | 12;
+}
+
+export type CargoPriority = 1 | 2 | 3;
+
+export interface CriticalCapacityReservation {
+  percent: number;
+  startHour: number;
+  endHour: number;
+}
+
+export interface RecoveryPlan {
+  scheduling: SchedulingPolicy;
+  stagingWindowsByVessel: Record<string, VesselStagingWindow>;
+  cargoPrioritiesByBatch: Record<string, CargoPriority>;
+  reserveBerthForCriticalCargo: boolean;
+  criticalCapacityReservation: CriticalCapacityReservation | null;
+  assignments: Record<string, string>;
+  objective: OptimizationObjective;
+  minimumCriticalCargoOnTimePercent: number;
+  maximumDisruptionCost: number | null;
 }
 
 export type StrategyAction =
   | { type: "schedule"; vesselId: string; portId: string }
   | { type: "prioritize"; vesselIds: string[]; reason: string }
-  | { type: "delay"; vesselId: string; hours: number; reason: string }
+  | { type: "delay"; vesselId: string; startHour: number; hours: number; reason: string }
   | { type: "allocate-resources"; portId: string; concurrentVessels: number }
+  | { type: "reserve-throughput"; criticalPercent: number; startHour: number; endHour: number }
+  | { type: "cargo-priority"; cargoId: string; priority: number }
   | { type: "reroute"; vesselId: string; fromPortId: string; toPortId: string };
 
-export interface RecoveryStrategy {
+export interface RecoveryStrategy extends RecoveryPlan {
   id: string;
   name: string;
   summary: string;
-  scheduling: "arrival-order" | "critical-first";
-  resourceMode: "available" | "dedicated-priority";
-  holdNonessentialHours: number;
-  assignments: Record<string, string>;
   actions: StrategyAction[];
 }
 
@@ -119,6 +145,8 @@ export interface OutcomeMetrics {
   portUtilizationPercent: number;
   delayedVessels: number;
   estimatedDelayCost: number | null;
+  estimatedInterventionCost: number | null;
+  estimatedDisruptionCost: number | null;
 }
 
 export interface SimulationSummary {
@@ -205,6 +233,7 @@ export interface Recommendation {
   generatedAt: string;
   selectedStrategyId: string;
   recommendationSummary: string;
+  decisionExplanation: string;
   actions: StrategyAction[];
   affectedShips: string[];
   affectedCargo: string[];
@@ -229,4 +258,21 @@ export interface Recommendation {
   humanApprovalRequired: true;
   dataProvenance: SimulationState["provenance"];
   warnings: string[];
+  decisionAudit: {
+    objective: OptimizationObjective;
+    minimumCriticalCargoOnTimePercent: number;
+    maximumDisruptionCost: number | null;
+    selectedStrategyId: string;
+    fallback: boolean;
+    candidates: Array<{
+      strategyId: string;
+      name: string;
+      plan: RecoveryPlan;
+      actions: StrategyAction[];
+      metrics: OutcomeMetrics;
+      probabilityOfMeetingTarget: number;
+      meetsConstraints: boolean;
+      selectionEligible: boolean;
+    }>;
+  };
 }

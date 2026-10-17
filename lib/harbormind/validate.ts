@@ -30,6 +30,7 @@ export function validateSimulationState(input: unknown): { state?: SimulationSta
       if (!finite(raw[key]) || raw[key] < 0 || ((key === "availableBerths" || key === "unloadingResources") && !Number.isInteger(raw[key]))) errors.push(`${path}.${key} must be a non-negative ${key === "availableBerths" || key === "unloadingResources" ? "integer" : "number"}.`);
     }
     for (const key of ["normalCapacityContainersPerDay", "currentCapacityContainersPerDay"] as const) if (finite(raw[key]) && raw[key] > 1_000_000) errors.push(`${path}.${key} cannot exceed 1,000,000 containers per day.`);
+    if (raw.rerouteCostPerContainer !== undefined && (!finite(raw.rerouteCostPerContainer) || raw.rerouteCostPerContainer < 0 || raw.rerouteCostPerContainer > 1_000_000_000)) errors.push(`${path}.rerouteCostPerContainer must be from 0 to 1,000,000,000.`);
     if (!stringList(raw.queueShipIds)) errors.push(`${path}.queueShipIds must be a string array.`);
     if (!stringList(raw.supportedHandling)) errors.push(`${path}.supportedHandling must be a string array.`);
     if (!validSource(raw.source)) errors.push(`${path}.source must be live, cached, or synthetic.`);

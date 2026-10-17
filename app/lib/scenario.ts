@@ -1,5 +1,5 @@
-import type { OperationalSnapshot, RecoveryPlanSelection, RecoveryStrategy, SimulationReplay, SimulationState } from "../../lib/harbormind/types.ts";
-import type { ActionId, ActionState, Scenario, ScenarioId } from "./data.ts";
+import type { OperationalSnapshot, RecoveryPlan, RecoveryStrategy, SimulationReplay, SimulationState } from "../../lib/harbormind/types.ts";
+import type { Scenario, ScenarioId } from "./data.ts";
 
 export function configureScenarioState(state: SimulationState, scenario: Scenario, capacityLoss: number, durationHours = 18): SimulationState {
   const isStorm = scenario.id === "storm";
@@ -32,38 +32,38 @@ export function snapshotAtHour(replay: SimulationReplay | null | undefined, hour
   return selected;
 }
 
-export function actionSelectionForStrategy(strategy: RecoveryStrategy): ActionState {
+export function recoveryPlanForStrategy(strategy: RecoveryStrategy): RecoveryPlan {
   return {
-    critical: strategy.scheduling === "critical-first",
-    stagger: strategy.holdNonessentialHours > 0,
-    trucks: strategy.resourceMode === "dedicated-priority",
-    divert: strategy.actions.some((action) => action.type === "reroute"),
+    scheduling: strategy.scheduling,
+    stagingWindowsByVessel: { ...strategy.stagingWindowsByVessel },
+    cargoPrioritiesByBatch: { ...strategy.cargoPrioritiesByBatch },
+    reserveBerthForCriticalCargo: strategy.reserveBerthForCriticalCargo,
+    criticalCapacityReservation: strategy.criticalCapacityReservation ? { ...strategy.criticalCapacityReservation } : null,
+    assignments: { ...strategy.assignments },
+    objective: strategy.objective,
+    minimumCriticalCargoOnTimePercent: strategy.minimumCriticalCargoOnTimePercent,
+    maximumDisruptionCost: strategy.maximumDisruptionCost,
   };
 }
 
-export function planSelectionForActions(actions: ActionState): RecoveryPlanSelection {
+export function copyRecoveryPlan(plan: RecoveryPlan): RecoveryPlan {
   return {
-    prioritizeCriticalCargo: actions.critical,
-    staggerLowerPriorityVessels: actions.stagger,
-    reserveCapacityForCriticalCargo: actions.trucks,
-    divertStandardShipment: actions.divert,
+    ...plan,
+    stagingWindowsByVessel: Object.fromEntries(Object.entries(plan.stagingWindowsByVessel).map(([id, window]) => [id, { ...window }])),
+    cargoPrioritiesByBatch: { ...plan.cargoPrioritiesByBatch },
+    criticalCapacityReservation: plan.criticalCapacityReservation ? { ...plan.criticalCapacityReservation } : null,
+    assignments: { ...plan.assignments },
   };
 }
 
-export function toggleAction(actions: ActionState, id: ActionId, checked: boolean): ActionState {
-  const next = { ...actions, [id]: checked };
-  if (id === "trucks" && checked) next.critical = true;
-  if (id === "critical" && !checked) next.trucks = false;
-  return next;
-}
-
-export function availableActionsForStrategies(strategies: RecoveryStrategy[]): ActionState {
-  return {
-    critical: strategies.some((strategy) => strategy.scheduling === "critical-first"),
-    stagger: strategies.some((strategy) => strategy.holdNonessentialHours > 0),
-    trucks: strategies.some((strategy) => strategy.resourceMode === "dedicated-priority"),
-    divert: strategies.some((strategy) => strategy.actions.some((action) => action.type === "reroute")),
-  };
+export function sameRecoveryPlan(left: RecoveryPlan | null, right: RecoveryPlan | null): boolean {
+  if (!left || !right) return left === right;
+  const sorted = (value: Record<string, unknown>) => Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b)));
+  const signature = (plan: RecoveryPlan) => JSON.stringify([
+    plan.scheduling, sorted(plan.stagingWindowsByVessel), sorted(plan.cargoPrioritiesByBatch), plan.reserveBerthForCriticalCargo,
+    plan.criticalCapacityReservation, sorted(plan.assignments), plan.objective, plan.minimumCriticalCargoOnTimePercent, plan.maximumDisruptionCost,
+  ]);
+  return signature(left) === signature(right);
 }
 
 export function scenarioSignature(id: ScenarioId, capacityLoss: number, duration: number): string {
