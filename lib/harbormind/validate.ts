@@ -33,7 +33,7 @@ export function validateSimulationState(input: unknown): { state?: SimulationSta
     if (!stringList(raw.queueShipIds)) errors.push(`${path}.queueShipIds must be a string array.`);
     if (!stringList(raw.supportedHandling)) errors.push(`${path}.supportedHandling must be a string array.`);
     if (!validSource(raw.source)) errors.push(`${path}.source must be live, cached, or synthetic.`);
-    if (!Array.isArray(raw.activeDisruptions) || raw.activeDisruptions.some((item) => !record(item) || !text(item.id) || !text(item.description) || !finite(item.severity) || item.severity < 0 || item.severity > 1)) errors.push(`${path}.activeDisruptions contains invalid data.`);
+    if (!Array.isArray(raw.activeDisruptions) || raw.activeDisruptions.some((item) => !record(item) || !text(item.id) || !text(item.description) || !finite(item.severity) || item.severity < 0 || item.severity > 1 || !finite(item.startHour) || !Number.isInteger(item.startHour) || item.startHour < 0 || item.startHour > 720 || !finite(item.durationHours) || !Number.isInteger(item.durationHours) || item.durationHours < 0 || item.durationHours > 720)) errors.push(`${path}.activeDisruptions contains invalid data.`);
   }
 
   const shipIds = new Set<string>();

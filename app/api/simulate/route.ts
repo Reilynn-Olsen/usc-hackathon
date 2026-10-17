@@ -1,4 +1,4 @@
-import { assertReplayBudget, assertSimulationBudget, DEFAULT_SIMULATION_OPTIONS, generateStrategies, generateStrategyForPlan, simulateStrategy, simulateStrategyWithReplay } from "../../../lib/harbormind/simulation.ts";
+import { assertReplayBudget, assertSimulationBudget, DEFAULT_SIMULATION_OPTIONS, generateStrategies, generateStrategyForPlan, simulateStrategyWithReplay } from "../../../lib/harbormind/simulation.ts";
 import { readHarnessRequest } from "../../../lib/harbormind/http.ts";
 import { validateStrategySelection } from "../../../lib/harbormind/decision.ts";
 import type { RecoveryPlanSelection } from "../../../lib/harbormind/types.ts";
@@ -29,12 +29,14 @@ export async function POST(request: Request) {
   const baseline = strategies.find((item) => item.id === "baseline-arrival-order")!;
   try {
     assertSimulationBudget(state, simulationOptions, strategy.id === baseline.id ? 1 : 2);
-    assertReplayBudget(state, simulationOptions);
+    assertReplayBudget(state, simulationOptions, strategy.id === baseline.id ? 1 : 2);
   } catch (error) {
     return Response.json({ error: error instanceof Error ? error.message : "Simulation request is too large." }, { status: 400 });
   }
-  const { summary: outcome, replay } = simulateStrategyWithReplay(state, strategy, simulationOptions);
-  const baselineOutcome = strategy.id === baseline.id ? outcome : simulateStrategy(state, baseline, simulationOptions);
+  const baselineResult = simulateStrategyWithReplay(state, baseline, simulationOptions);
+  const selectedResult = strategy.id === baseline.id ? baselineResult : simulateStrategyWithReplay(state, strategy, simulationOptions);
+  const { summary: outcome, replay } = selectedResult;
+  const baselineOutcome = baselineResult.summary;
   return Response.json({
     scenarioId: state.scenarioId,
     strategyId: strategy.id,
@@ -42,6 +44,7 @@ export async function POST(request: Request) {
     outcome,
     baseline: baselineOutcome,
     replay,
+    baselineReplay: baselineResult.replay,
     criticalCargoOnTimeChangePercent: Math.round((outcome.mean.criticalCargoOnTimePercent - baselineOutcome.mean.criticalCargoOnTimePercent) * 100) / 100,
     dataProvenance: state.provenance,
     humanApprovalRequired: true,
