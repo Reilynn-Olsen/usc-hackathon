@@ -18,15 +18,16 @@ export class SimulationBudgetError extends Error {}
 
 export function assertSimulationBudget(state: SimulationState, options: SimulationOptions, strategyCount: number): void {
   const cargoBatchCount = state.ships.reduce((sum, ship) => sum + ship.cargo.length, 0);
-  const estimatedWork = (state.ships.length * state.ports.length + cargoBatchCount + state.ships.length + state.ports.length)
-    * Math.ceil(options.horizonHours / options.timeStepHours) * options.runs * strategyCount;
+  const steps = Math.ceil(options.horizonHours / options.timeStepHours);
+  const estimatedWork = ((state.ships.length * state.ports.length + cargoBatchCount + state.ships.length + state.ports.length) * steps
+    + state.ports.length * options.horizonHours) * options.runs * strategyCount;
   if (estimatedWork > MAX_SIMULATION_WORK) throw new SimulationBudgetError("Simulation request is too large; reduce runs, horizonHours, or the number of ships and cargo batches.");
 }
 
 const MAX_REPLAY_CELLS = 100_000;
-export function assertReplayBudget(state: SimulationState, options: SimulationOptions): void {
+export function assertReplayBudget(state: SimulationState, options: SimulationOptions, replayCount = 1): void {
   const cargoBatchCount = state.ships.reduce((sum, ship) => sum + ship.cargo.length, 0);
-  const cells = (state.ships.length + cargoBatchCount + state.ports.length) * (Math.ceil(options.horizonHours / options.timeStepHours) + 1);
+  const cells = replayCount * (state.ships.length + cargoBatchCount + state.ports.length) * (Math.ceil(options.horizonHours / options.timeStepHours) + 1);
   if (cells > MAX_REPLAY_CELLS) throw new SimulationBudgetError("Replay output is too large; reduce horizonHours or the number of cargo batches.");
 }
 
@@ -281,28 +282,33 @@ function simulateRun(
   const totalCargoContainers = allCargo.reduce((sum, item) => sum + item.cargo.containers, 0);
   const hasCompleteCostInputs = allCargo.length > 0 && allCargo.every((item) => item.cargo.delayCostPerContainerHour !== undefined);
   let totalProcessed = 0;
+  let nominalCapacity = 0;
   let criticalOnTimeContainers = 0;
   let delayContainerHours = 0;
   let estimatedDelayCost = 0;
   const snapshots: OperationalSnapshot[] | undefined = captureReplay ? [] : undefined;
   const totalStepCount = Math.ceil(options.horizonHours / options.timeStepHours);
 
+  const activeDisruptionsAt = (port: SimulationState["ports"][number], hour: number) => port.activeDisruptions
+    .filter((disruption) => disruption.startHour <= hour && hour < disruption.startHour + disruption.durationHours);
+
   const effectiveCapacityPerHour = (portId: string, hour: number) => {
     const port = state.ports.find((item) => item.portId === portId)!;
     const factors = portFactors.get(portId)!;
     const weather = clamp(weatherSeverityAt(state, portId, hour) * (1 + factors.weatherVariation), 0, 1);
-    return port.currentCapacityContainersPerDay / 24 * (1 - weather * 0.18) * factors.capacityFactor / factors.unloadingFactor;
+    const remainingCapacity = activeDisruptionsAt(port, hour).reduce((remaining, disruption) => remaining * (1 - disruption.severity), 1);
+    return port.currentCapacityContainersPerDay / 24 * clamp(remainingCapacity, 0, 1) * (1 - weather * 0.18) * factors.capacityFactor / factors.unloadingFactor;
   };
 
-  const captureSnapshot = (hour: number, capacities: Map<string, number>, unloadedByPort: Map<string, number>, unloadingVesselIds: Set<string>) => {
+  const captureSnapshot = (hour: number, unloadedByPort: Map<string, number>, unloadingVesselIds: Set<string>) => {
     if (!snapshots) return;
     const cargoBatches = jobs.flatMap((job) => cargoSnapshot(job, unloadingVesselIds));
     snapshots.push({
       simulationHour: round(hour),
       ports: state.ports.map((port) => ({
         portId: port.portId,
-        capacityContainersPerHour: round(capacities.get(port.portId) ?? 0),
-        activeDisruptions: port.activeDisruptions,
+        capacityContainersPerHour: round(effectiveCapacityPerHour(port.portId, hour)),
+        activeDisruptions: activeDisruptionsAt(port, hour),
         waitingVesselIds: jobs.filter((job) => job.portId === port.portId && job.status === "waiting").map((job) => job.ship.vesselId),
         berthAssignments: jobs.filter((job) => job.portId === port.portId && job.status === "berthed" && job.berthId).map((job) => ({ berthId: job.berthId!, vesselId: job.ship.vesselId })),
         containersUnloadedThisStep: unloadedByPort.get(port.portId) ?? 0,
@@ -332,22 +338,22 @@ function simulateRun(
   };
 
   updateArrivals(0);
-  const capacitiesAtStart = new Map(state.ports.map((port) => [port.portId, effectiveCapacityPerHour(port.portId, 0)]));
-  captureSnapshot(0, capacitiesAtStart, new Map(), new Set());
+  captureSnapshot(0, new Map(), new Set());
 
   for (let stepIndex = 0; stepIndex < totalStepCount; stepIndex++) {
     const startHour = stepIndex * options.timeStepHours;
     const endHour = Math.min(options.horizonHours, startHour + options.timeStepHours);
     const elapsedHours = endHour - startHour;
     updateArrivals(startHour);
-    const capacityByPort = new Map<string, number>();
     const unloadedByPort = new Map<string, number>();
     const unloadingVesselIds = new Set<string>();
 
     for (const port of state.ports) {
       const factors = portFactors.get(port.portId)!;
-      const hourlyCapacity = effectiveCapacityPerHour(port.portId, startHour);
-      capacityByPort.set(port.portId, hourlyCapacity);
+      const intervalCapacity = Array.from({ length: elapsedHours }, (_, hour) => effectiveCapacityPerHour(port.portId, startHour + hour))
+        .reduce((sum, capacity) => sum + capacity, 0);
+      const hourlyCapacity = elapsedHours ? intervalCapacity / elapsedHours : 0;
+      nominalCapacity += intervalCapacity;
       const portJobs = jobs.filter((job) => job.portId === port.portId);
       const freeBerthIds = Array.from({ length: Math.max(0, port.availableBerths) }, (_, index) => `${port.portId}-berth-${index + 1}`)
         .filter((berthId) => !portJobs.some((job) => job.berthId === berthId));
@@ -423,7 +429,7 @@ function simulateRun(
     }
 
     updateArrivals(endHour);
-    captureSnapshot(endHour, capacityByPort, unloadedByPort, unloadingVesselIds);
+    captureSnapshot(endHour, unloadedByPort, unloadingVesselIds);
   }
 
   const delayedVessels = jobs.filter((job) => job.arrivalHour <= options.horizonHours
@@ -435,7 +441,6 @@ function simulateRun(
     delayContainerHours += remaining * delayHours;
     if (hasCompleteCostInputs) estimatedDelayCost += remaining * delayHours * (item.cargo.delayCostPerContainerHour ?? 0);
   }
-  const nominalCapacity = state.ports.reduce((sum, port) => sum + port.currentCapacityContainersPerDay * options.horizonHours / 24, 0);
   return {
     metrics: {
       criticalCargoOnTimePercent: criticalContainerCount ? 100 * criticalOnTimeContainers / criticalContainerCount : 100,

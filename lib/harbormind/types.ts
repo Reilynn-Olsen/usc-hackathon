@@ -12,6 +12,14 @@ export interface Cargo {
   source: DataSource;
 }
 
+export interface PortDisruption {
+  id: string;
+  description: string;
+  severity: number;
+  startHour: number;
+  durationHours: number;
+}
+
 export interface Port {
   portId: string;
   location: { name: string; latitude: number; longitude: number };
@@ -20,7 +28,7 @@ export interface Port {
   availableBerths: number;
   unloadingResources: number;
   queueShipIds: string[];
-  activeDisruptions: Array<{ id: string; description: string; severity: number }>;
+  activeDisruptions: PortDisruption[];
   supportedHandling: string[];
   source: DataSource;
 }

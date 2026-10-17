@@ -6,7 +6,7 @@ import { applyAisPositionReport, applyOpenMeteoForecast } from "../lib/harbormin
 import { generateStrategies, generateStrategyForPlan, simulateStrategy, simulateStrategyWithReplay } from "../lib/harbormind/simulation.ts";
 import { validateSimulationState } from "../lib/harbormind/validate.ts";
 import { SCENARIOS, EMPTY_ACTIONS } from "../app/lib/data.ts";
-import { actionSelectionForStrategy, availableActionsForStrategies, configureScenarioState, isLatestScenarioRequest, scenarioSignature, toggleAction } from "../app/lib/scenario.ts";
+import { actionSelectionForStrategy, availableActionsForStrategies, configureScenarioState, isLatestScenarioRequest, replayForMode, scenarioSignature, snapshotAtHour, toggleAction } from "../app/lib/scenario.ts";
 import { GET as getScenario } from "../app/api/scenario/route.ts";
 import { POST as postStrategies } from "../app/api/strategies/route.ts";
 import { POST as postSimulation } from "../app/api/simulate/route.ts";
@@ -17,9 +17,9 @@ const scenario = () => createStormScenario(startAt);
 function cargoOperationsState() {
   const state = scenario();
   const port = {
-    ...state.ports[0], currentCapacityContainersPerDay: 12, normalCapacityContainersPerDay: 24,
+    ...state.ports[0], currentCapacityContainersPerDay: 24, normalCapacityContainersPerDay: 24,
     availableBerths: 1, unloadingResources: 1, queueShipIds: ["vessel-a", "vessel-b"],
-    activeDisruptions: [{ id: "fog-18h", description: "Synthetic reduced port throughput", severity: 0.5 }],
+    activeDisruptions: [{ id: "fog-18h", description: "Synthetic reduced port throughput", severity: 0.5, startHour: 0, durationHours: 18 }],
   };
   const cargo = (source, cargoId, category, containers, essential, deadline) => ({
     ...source, cargoId, category, containers, essential, deadline, delayCostPerContainerHour: 2, specialHandling: [],
@@ -68,7 +68,7 @@ test("simulated throughput respects port capacity and fixed seed repeats exactly
   const first = simulateStrategy(state, baseline, options);
   const second = simulateStrategy(state, baseline, options);
   assert.deepEqual(first, second);
-  assert.ok(first.mean.totalContainersProcessed <= 96 + 0.01);
+  assert.ok(first.mean.totalContainersProcessed <= 132 + 0.01);
   assert.notEqual(first.mean.estimatedDelayCost, null);
   delete state.ships[0].cargo[0].delayCostPerContainerHour;
   assert.equal(simulateStrategy(state, baseline, options).mean.estimatedDelayCost, null);
@@ -111,6 +111,61 @@ test("hourly cargo replay unloads urgent batches ahead of earlier manifest items
   );
   assert.deepEqual(priorityResult.replay.snapshots[0].ports.map(({ portId, capacityContainersPerHour }) => [portId, capacityContainersPerHour]),
     baseResult.replay.snapshots[0].ports.map(({ portId, capacityContainersPerHour }) => [portId, capacityContainersPerHour]));
+});
+
+test("an 18-hour disruption begins at T+0, remains through T+17, then restores port capacity", () => {
+  const state = configureScenarioState(scenario(), SCENARIOS.find((item) => item.id === "fog"), 35, 18);
+  state.weather = [];
+  const baseline = generateStrategies(state).find((item) => item.id === "baseline-arrival-order");
+  const { replay } = simulateStrategyWithReplay(state, baseline, { runs: 1, seed: 7, horizonHours: 36, maxArrivalDelayHours: 0, capacityReductionVariation: 0, unloadingTimeVariation: 0, weatherSeverityVariation: 0, equipmentFailureProbability: 0 });
+  const at = (hour) => replay.snapshots.find((snapshot) => snapshot.simulationHour === hour).ports[0];
+  assert.equal(at(0).capacityContainersPerHour, 6.5);
+  assert.equal(at(0).activeDisruptions.length, 1);
+  assert.equal(at(17).activeDisruptions.length, 1);
+  assert.equal(at(17).capacityContainersPerHour, 6.5);
+  assert.equal(at(18).activeDisruptions.length, 0);
+  assert.equal(at(18).capacityContainersPerHour, 10);
+  assert.equal(replay.snapshots.at(-1).simulationHour, 36);
+});
+
+test("overlapping disruption capacity losses multiply and remain bounded at event boundaries", () => {
+  const state = scenario();
+  state.weather = [];
+  state.ports[0].currentCapacityContainersPerDay = 240;
+  state.ports[0].activeDisruptions = [
+    { id: "first", description: "first", severity: 0.5, startHour: 0, durationHours: 2 },
+    { id: "second", description: "second", severity: 0.5, startHour: 1, durationHours: 2 },
+  ];
+  const baseline = generateStrategies(state).find((item) => item.id === "baseline-arrival-order");
+  const { replay } = simulateStrategyWithReplay(state, baseline, { runs: 1, seed: 2, horizonHours: 4, maxArrivalDelayHours: 0, capacityReductionVariation: 0, unloadingTimeVariation: 0, weatherSeverityVariation: 0, equipmentFailureProbability: 0 });
+  const capacities = replay.snapshots.map((snapshot) => snapshot.ports[0]);
+  assert.deepEqual(capacities.slice(0, 4).map((port) => port.capacityContainersPerHour), [5, 2.5, 5, 10]);
+  assert.deepEqual(capacities.slice(0, 4).map((port) => port.activeDisruptions.length), [1, 2, 1, 0]);
+  assert.ok(capacities.every((port) => port.capacityContainersPerHour >= 0 && port.capacityContainersPerHour <= 10));
+});
+
+test("a disruption boundary inside a multi-hour step contributes capacity only for its active hours", () => {
+  const state = scenario();
+  state.weather = [];
+  state.ports[0].activeDisruptions = [{ id: "partial-step", description: "partial step", severity: 0.5, startHour: 1, durationHours: 2 }];
+  const baseline = generateStrategies(state).find((item) => item.id === "baseline-arrival-order");
+  const { replay } = simulateStrategyWithReplay(state, baseline, { runs: 1, seed: 3, horizonHours: 4, timeStepHours: 2, maxArrivalDelayHours: 0, capacityReductionVariation: 0, unloadingTimeVariation: 0, weatherSeverityVariation: 0, equipmentFailureProbability: 0 });
+  assert.equal(replay.snapshots[1].simulationHour, 2);
+  assert.equal(replay.snapshots[1].ports[0].activeDisruptions.length, 1);
+  assert.equal(replay.snapshots[1].ports[0].capacityContainersPerHour, 5);
+  assert.equal(replay.snapshots[1].ports[0].containersUnloadedThisStep, 15);
+  assert.equal(replay.snapshots[2].ports[0].activeDisruptions.length, 0);
+  assert.equal(replay.snapshots[2].ports[0].containersUnloadedThisStep, 15);
+});
+
+test("replay mode selects the matching plan, scrubbing chooses the latest available snapshot, and missing data is safe", () => {
+  const baseline = { snapshots: [{ simulationHour: 0 }, { simulationHour: 2 }, { simulationHour: 4 }] };
+  const recovery = { snapshots: [{ simulationHour: 0 }, { simulationHour: 1 }] };
+  assert.equal(replayForMode("baseline", baseline, recovery), baseline);
+  assert.equal(replayForMode("recovery", baseline, recovery), recovery);
+  assert.equal(snapshotAtHour(baseline, 3), baseline.snapshots[1]);
+  assert.equal(snapshotAtHour(null, 3), null);
+  assert.equal(replayForMode("baseline"), null);
 });
 
 test("standard-shipment rerouting excludes essential vessels and requires a feasible modeled alternative", () => {
@@ -208,8 +263,9 @@ test("scenario controls produce backend input and action cards reflect feasible 
   const fog = configureScenarioState(state, SCENARIOS.find((item) => item.id === "fog"), 35);
   assert.deepEqual(validateSimulationState(fog).errors, []);
   assert.equal(fog.scenarioId, "fog");
-  assert.equal(fog.ports[0].currentCapacityContainersPerDay, 156);
+  assert.equal(fog.ports[0].currentCapacityContainersPerDay, 240);
   assert.equal(fog.ports[0].activeDisruptions[0].severity, 0.35);
+  assert.equal(fog.ports[0].activeDisruptions[0].durationHours, 18);
   assert.deepEqual(fog.weather, []);
   assert.equal(fog.provenance.weather, "unavailable");
   assert.notEqual(scenarioSignature("storm", 60, 12), scenarioSignature("fog", 35, 12));
@@ -245,6 +301,8 @@ test("dense fog recommendation and plan evaluation use the same horizon, seed, a
   assert.deepEqual(evaluated.outcome, result.recommendation.estimatedOutcomes);
   assert.deepEqual(evaluated.baseline, result.recommendation.baselineComparison.baseline);
   assert.equal(evaluated.replay.sampleRunIndex, 0);
+  assert.equal(evaluated.baselineReplay.sampleRunIndex, 0);
+  assert.deepEqual(evaluated.baselineReplay.snapshots, simulateStrategyWithReplay(fog, generateStrategies(fog)[0], options).replay.snapshots);
   assert.equal(evaluated.replay.snapshots.length, 37);
   assert.equal(evaluated.replay.snapshots.at(-1).simulationHour, 36);
 });
@@ -279,6 +337,7 @@ test("combined recovery actions are validated and use the same seeded baseline s
 
 test("a selected action may perform worse than baseline and the simulator returns the loss", () => {
   const state = scenario();
+  state.ports[0].activeDisruptions[0].durationHours = 72;
   for (const ship of state.ships) for (const cargo of ship.cargo) {
     cargo.essential = false;
     cargo.deadline = "2026-10-16T13:00:00.000Z";
