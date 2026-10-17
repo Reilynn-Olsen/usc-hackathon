@@ -14,17 +14,20 @@ No additional npm dependencies are required by this demo. Three.js v0.180.0 load
 
 - 3D port geometry, select/focus ships, dotted shipping paths, camera pan/zoom/orbit and weather footprints.
 - Command center with synthetic fleet and terminal readings.
-- Configure four disruptions with capacity reduction and duration controls.
-- Run a deterministic *illustrative* impact simulation; choose recommendations or custom actions; evaluate, compare, undo and reset plans.
-- About/project architecture and honest integration status.
+- Configure four disruptions with capacity reduction and simulation horizon controls.
+- Run the server-side Monte Carlo simulator against the scenario state and optional Open-Meteo forecast.
+- Send feasible candidates to the server-side Jev harness, select a recommended or alternative strategy, and compare custom action combinations using matching seeds and horizons.
+- Label deterministic fallbacks and local mocks separately from Jev responses.
 - Responsive layout for desktop, tablet and phone.
 
-## Hook up your real engine later
+## Server-side decision and simulation APIs
 
-- `app/lib/data.ts`: replace example `SHIPS`/`SCENARIOS` and `estimateOutcome(...)` with backend responses. This file defines the baseline data contracts.
-- `app/page.tsx`: replace `runScenario()` and `evaluatePlan()` with calls to your Next.js server's API routes, which can proxy to your Dockerized port simulator and Jev harness. Don't call private Jev endpoints from the browser.
-- `app/components/PortMap3D.tsx`: map API positions/route geometry can be derived from real tracked coordinates once you have a coordinate transformation into the local map system.
+- `GET /api/scenario` supplies the current synthetic port, vessel, cargo, and weather state.
+- `GET /api/weather` adapts a live Open-Meteo forecast when available.
+- `POST /api/recommendation` runs feasible strategies and calls the TypeSafe Jev SDK. Set `TYPESAFE_API_KEY` in the server environment for real Jev decisions.
+- `POST /api/simulate` accepts either a server-generated `strategyId` or a four-boolean `plan` (`prioritizeCriticalCargo`, `staggerLowerPriorityVessels`, `reserveCapacityForCriticalCargo`, `divertStandardShipment`). The server validates feasibility and returns plan and baseline outcomes plus a seeded, one-hour operational replay; `options.timeStepHours` can select an integer step from 1 to 24 hours.
+- `JEV_MOCK=true` enables the existing local mock only outside production; the UI labels it explicitly. Missing credentials or Jev failures produce a labeled deterministic fallback.
 
 ## Important
 
-This is a UI demonstrator. All port/ship/cargo data, the weather zone, the recommendations, probability-like outputs and estimates are generated examples, **not** real forecasts, operational instructions or responses from Jev. The browser-only scoring model does not simulate real operational constraints.
+The included port, vessel, and cargo state is synthetic. Weather is labeled by provenance. Simulation snapshots model berth queues, partial cargo-batch unloading, vessel operational states, and deadlines. Port throughput uses the scenario's current capacity for the full horizon; disruptions do not yet have independent start and end times. The simulator returns seeded estimates and a probability of meeting its critical-cargo target; it does not calculate vessel-delay, congestion-overflow, or cost-threshold likelihoods. The 3D vessel tracks remain illustrative until the frontend consumes replay states. No result is an operational forecast or instruction.

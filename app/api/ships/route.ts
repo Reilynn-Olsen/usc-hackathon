@@ -1,5 +1,3 @@
-export const runtime = "nodejs";
-
 const encoder = new TextEncoder();
 const boundingBoxes = [[[33.55, -118.5], [33.9, -118.1]]];
 

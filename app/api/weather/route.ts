@@ -17,8 +17,8 @@ export async function GET() {
 
   try {
     const [weatherResponse, marineResponse] = await Promise.all([
-      fetch(weatherUrl),
-      fetch(marineUrl),
+      fetch(weatherUrl, { signal: AbortSignal.timeout(8_000) }),
+      fetch(marineUrl, { signal: AbortSignal.timeout(8_000) }),
     ]);
 
     if (!weatherResponse.ok || !marineResponse.ok) {

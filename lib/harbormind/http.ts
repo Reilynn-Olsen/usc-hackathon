@@ -28,15 +28,16 @@ export async function readHarnessRequest(request: Request): Promise<{ value?: Ha
   }
   const options = (rawOptions ?? {}) as Record<string, unknown>;
   const errors: string[] = [];
-  const allowedOptions = new Set(["runs", "seed", "horizonHours", "criticalCargoOnTimeTargetPercent", "maxArrivalDelayHours", "weatherSeverityVariation", "capacityReductionVariation", "unloadingTimeVariation", "equipmentFailureProbability"]);
+  const allowedOptions = new Set(["runs", "seed", "horizonHours", "timeStepHours", "criticalCargoOnTimeTargetPercent", "maxArrivalDelayHours", "weatherSeverityVariation", "capacityReductionVariation", "unloadingTimeVariation", "equipmentFailureProbability"]);
   for (const key of Object.keys(options)) if (!allowedOptions.has(key)) errors.push(`options.${key} is not supported.`);
-  const integer = (key: "runs" | "seed" | "horizonHours", min: number, max: number) => {
+  const integer = (key: "runs" | "seed" | "horizonHours" | "timeStepHours", min: number, max: number) => {
     const value = options[key];
     if (value !== undefined && (typeof value !== "number" || !Number.isInteger(value) || value < min || value > max)) errors.push(`options.${key} must be an integer from ${min} to ${max}.`);
   };
   integer("runs", 1, 500);
   integer("seed", 0, 4_294_967_295);
   integer("horizonHours", 1, 720);
+  integer("timeStepHours", 1, 24);
   const ranges: Array<[keyof SimulationOptions, number, number]> = [
     ["criticalCargoOnTimeTargetPercent", 0, 100],
     ["maxArrivalDelayHours", 0, 168],

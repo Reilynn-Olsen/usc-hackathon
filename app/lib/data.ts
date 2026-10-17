@@ -44,44 +44,13 @@ export const SCENARIOS: Scenario[] = [
 ];
 
 export type ActionId = "critical" | "stagger" | "trucks" | "divert";
-export type Action = { id: ActionId; name: string; detail: string; benefit: string; recommended: boolean };
+export type Action = { id: ActionId; name: string; detail: string; benefit: string };
 export const ACTIONS: Action[] = [
-  { id: "critical", name: "Prioritize critical cargo", detail: "Assign the next open berth to medical and perishable shipments.", benefit: "Protects priority deadlines", recommended: true },
-  { id: "stagger", name: "Stagger vessel arrivals", detail: "Hold standard-priority ships offshore to reduce queuing at the channel.", benefit: "Reduces berth congestion", recommended: true },
-  { id: "trucks", name: "Reserve landside capacity", detail: "Protect available truck and terminal slots for time-sensitive containers.", benefit: "Faster cargo release", recommended: true },
-  { id: "divert", name: "Divert a standard shipment", detail: "Test a diversion to another terminal with extra transit and handling costs.", benefit: "Frees one docking window", recommended: false },
+  { id: "critical", name: "Prioritize critical cargo", detail: "Schedule ships with essential cargo ahead of other vessels.", benefit: "Uses explicit cargo deadlines" },
+  { id: "stagger", name: "Stagger vessel arrivals", detail: "Hold lower-priority vessels for eight hours while essential cargo moves first.", benefit: "Uses modeled vessel arrival holds" },
+  { id: "trucks", name: "Reserve unloading capacity", detail: "Limit concurrent unloading so essential cargo can use a dedicated position.", benefit: "Uses modeled berths and unloading resources" },
+  { id: "divert", name: "Divert a standard shipment", detail: "Reroute an eligible nonessential vessel to a modeled alternative port.", benefit: "Only offered for feasible alternative ports" },
 ];
 
 export type ActionState = Record<ActionId, boolean>;
 export const EMPTY_ACTIONS: ActionState = { critical: false, stagger: false, trucks: false, divert: false };
-export const RECOMMENDED_ACTIONS: ActionState = { critical: true, stagger: true, trucks: true, divert: false };
-
-export type Outcome = {
-  criticalOnTime: number;
-  averageDelay: number;
-  cargoAtRisk: number;
-  operatingCost: number;
-  recoveredHours: number;
-};
-
-/** A small, deterministic *illustrative* model, not real port forecasts or Jev output. */
-export function estimateOutcome(scenarioId: ScenarioId, capacityLoss: number, duration: number, actions: ActionState): Outcome {
-  const drag = (capacityLoss / 100) * (0.66 + duration / 36);
-  const disruption = scenarioId === "storm" ? 1.12 : scenarioId === "fog" ? 0.76 : scenarioId === "wind" ? 0.9 : 1.03;
-  const baseOnTime = 94 - drag * 55 * disruption;
-  const baseDelay = 0.8 + drag * 11.2 * disruption;
-  const gain = (actions.critical ? 12 : 0) + (actions.stagger ? 7 : 0) + (actions.trucks ? 6 : 0) + (actions.divert ? 3 : 0);
-  const delayGain = (actions.critical ? 1.0 : 0) + (actions.stagger ? 2.2 : 0) + (actions.trucks ? 1.0 : 0) + (actions.divert ? 0.75 : 0);
-  const extraCost = (actions.critical ? 14 : 0) + (actions.stagger ? 9 : 0) + (actions.trucks ? 18 : 0) + (actions.divert ? 74 : 0);
-  const onTime = Math.min(98, Math.max(18, baseOnTime + gain * (0.65 + drag * 0.55)));
-  const delay = Math.max(0.7, baseDelay - delayGain * (0.55 + drag * 0.4));
-  const risk = Math.max(35, Math.round(1920 * drag * disruption - gain * 24));
-  const cost = Math.round(42 + (drag * 160 * disruption) + extraCost);
-  return {
-    criticalOnTime: Math.round(onTime),
-    averageDelay: Number(delay.toFixed(1)),
-    cargoAtRisk: risk,
-    operatingCost: cost,
-    recoveredHours: Math.max(0, Number((baseDelay - delay).toFixed(1))),
-  };
-}

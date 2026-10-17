@@ -36,8 +36,24 @@ function reviewIndicators(state: SimulationState): string[] {
     if (Math.min(port.availableBerths, port.unloadingResources) < port.queueShipIds.length) result.push(`${port.location.name} has fewer concurrent unloading positions than queued ships.`);
   }
   for (const weather of state.weather) for (const alert of weather.alerts) result.push(`${weather.portId}: ${alert.description}`);
+  if (state.provenance.weather === "unavailable") result.push("Weather forecast data is unavailable for this scenario.");
   if (state.provenance.weatherAlerts === "unavailable" || state.provenance.weatherAlerts === "mixed") result.push("Severe weather alert coverage is unavailable or incomplete in the supplied weather data.");
   return [...new Set(result)];
+}
+
+function affectedShipsForStrategy(state: SimulationState, strategy: RecoveryStrategy, baseline: RecoveryStrategy): string[] {
+  const affected = new Set<string>();
+  const baselineOrder = baseline.actions.filter((action) => action.type === "schedule").map((action) => action.vesselId);
+  const strategyOrder = strategy.actions.filter((action) => action.type === "schedule").map((action) => action.vesselId);
+  strategyOrder.forEach((vesselId, index) => { if (vesselId !== baselineOrder[index]) affected.add(vesselId); });
+  for (const ship of state.ships) if (strategy.assignments[ship.vesselId] !== baseline.assignments[ship.vesselId]) affected.add(ship.vesselId);
+  for (const action of strategy.actions) {
+    if (action.type === "delay") affected.add(action.vesselId);
+    if (action.type === "allocate-resources") for (const ship of state.ships) {
+      if (strategy.assignments[ship.vesselId] === action.portId && hasCriticalCargo(ship)) affected.add(ship.vesselId);
+    }
+  }
+  return [...affected];
 }
 
 function modelSummary(state: SimulationState, strategies: RecoveryStrategy[], outcomes: Map<string, SimulationSummary>) {
@@ -70,6 +86,7 @@ function modelSummary(state: SimulationState, strategies: RecoveryStrategy[], ou
 
 const probabilityRecord = (value: object) => Object.fromEntries(Object.entries(value)) as Record<string, number>;
 const legendRecord = (value: object) => Object.fromEntries(Object.entries(value)) as Record<string, string>;
+const hasCriticalCargo = (ship: SimulationState["ships"][number]) => ship.cargo.some((cargo) => cargo.essential);
 
 export const callJev: JevCall = async (state, strategies, outcomes) => {
   if (!process.env.TYPESAFE_API_KEY) throw new Error("TYPESAFE_API_KEY is not configured.");
@@ -139,7 +156,7 @@ export async function createRecommendation(
   state: SimulationState,
   partialOptions: Partial<SimulationOptions> = {},
   jevCall: JevCall = callJev,
-): Promise<{ recommendation: Recommendation; strategies: RecoveryStrategy[] }> {
+): Promise<{ recommendation: Recommendation; strategies: RecoveryStrategy[]; evaluatedStrategies: Array<{ strategy: RecoveryStrategy; outcome: SimulationSummary; affectedShips: string[]; affectedCargo: string[] }> }> {
   const options = { ...DEFAULT_SIMULATION_OPTIONS, ...partialOptions };
   const strategies = generateStrategies(state, options.horizonHours);
   if (!strategies.length) throw new Error("No feasible recovery strategy exists for this state.");
@@ -179,7 +196,7 @@ export async function createRecommendation(
   const selectedStrategy = strategies.find((strategy) => strategy.id === selectedStrategyId)!;
   const selected = outcomes.get(selectedStrategyId)!;
   const baseline = outcomes.get(baselineStrategy.id)!;
-  const changedShips = [...new Set(selectedStrategy.actions.flatMap((action) => action.type === "prioritize" ? action.vesselIds : "vesselId" in action ? [action.vesselId] : []))];
+  const changedShips = affectedShipsForStrategy(state, selectedStrategy, baselineStrategy);
   const affectedCargo = state.ships.filter((ship) => changedShips.includes(ship.vesselId)).flatMap((ship) => ship.cargo.map((cargo) => cargo.cargoId));
   const riskIndicators = reviewIndicators(state);
   const recommendation: Recommendation = {
@@ -206,7 +223,16 @@ export async function createRecommendation(
     dataProvenance: state.provenance,
     warnings: [...new Set(warnings)],
   };
-  return { recommendation, strategies };
+  const evaluatedStrategies = strategies.map((strategy) => {
+    const affectedShips = affectedShipsForStrategy(state, strategy, baselineStrategy);
+    return {
+      strategy,
+      outcome: outcomes.get(strategy.id)!,
+      affectedShips,
+      affectedCargo: state.ships.filter((ship) => affectedShips.includes(ship.vesselId)).flatMap((ship) => ship.cargo.map((cargo) => cargo.cargoId)),
+    };
+  });
+  return { recommendation, strategies, evaluatedStrategies };
 }
 
 export function validateStrategySelection(strategyId: unknown, strategies: RecoveryStrategy[]): RecoveryStrategy | undefined {

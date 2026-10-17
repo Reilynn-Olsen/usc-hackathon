@@ -81,7 +81,8 @@ export function validateSimulationState(input: unknown): { state?: SimulationSta
   }
 
   if (record(input.provenance)) {
-    for (const key of ["ports", "shipPositions", "shipEtaAndCargo", "weather"] as const) if (!validProvenance(input.provenance[key])) errors.push(`provenance.${key} must be live, cached, synthetic, or mixed.`);
+    for (const key of ["ports", "shipPositions", "shipEtaAndCargo"] as const) if (!validProvenance(input.provenance[key])) errors.push(`provenance.${key} must be live, cached, synthetic, or mixed.`);
+    if (input.provenance.weather !== "unavailable" && !validProvenance(input.provenance.weather)) errors.push("provenance.weather must be live, cached, synthetic, mixed, or unavailable.");
     if (input.provenance.weatherAlerts !== "unavailable" && !validProvenance(input.provenance.weatherAlerts)) errors.push("provenance.weatherAlerts must be live, cached, synthetic, mixed, or unavailable.");
   }
 
