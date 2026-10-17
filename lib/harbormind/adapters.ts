@@ -18,7 +18,7 @@ function updateProvenance(state: SimulationState): SimulationState {
       ports: combinedSource(state.ports.map((port) => port.source), state.provenance.ports),
       shipPositions: combinedSource(state.ships.map((ship) => ship.positionSource), state.provenance.shipPositions),
       shipEtaAndCargo: combinedSource(state.ships.flatMap((ship) => [ship.operationsSource, ...ship.cargo.map((cargo) => cargo.source)]), state.provenance.shipEtaAndCargo),
-      weather: combinedSource(state.weather.map((item) => item.source), state.provenance.weather),
+      weather: state.weather.length ? combined(state.weather.map((item) => item.source)) as ProvenanceSource : state.provenance.weather,
       weatherAlerts: state.weather.length ? combined(state.weather.map((item) => item.alertsSource)) : state.provenance.weatherAlerts,
     },
   };

@@ -61,9 +61,16 @@ export interface SimulationState {
     ports: ProvenanceSource;
     shipPositions: ProvenanceSource;
     shipEtaAndCargo: ProvenanceSource;
-    weather: ProvenanceSource;
+    weather: ProvenanceSource | "unavailable";
     weatherAlerts: ProvenanceSource | "unavailable";
   };
+}
+
+export interface RecoveryPlanSelection {
+  prioritizeCriticalCargo: boolean;
+  staggerLowerPriorityVessels: boolean;
+  reserveCapacityForCriticalCargo: boolean;
+  divertStandardShipment: boolean;
 }
 
 export type StrategyAction =
@@ -88,6 +95,7 @@ export interface SimulationOptions {
   runs: number;
   seed: number;
   horizonHours: number;
+  timeStepHours: number;
   criticalCargoOnTimeTargetPercent: number;
   maxArrivalDelayHours: number;
   weatherSeverityVariation: number;
@@ -112,6 +120,51 @@ export interface SimulationSummary {
   runs: number;
   seed: number;
   horizonHours: number;
+  timeStepHours: number;
+}
+
+export interface CargoBatchSnapshot {
+  batchId: string;
+  vesselId: string;
+  category: string;
+  criticality: "critical" | "standard";
+  deadline: string;
+  specialHandling: string[];
+  containers: number;
+  containersUnloaded: number;
+  containersRemaining: number;
+  status: "not-arrived" | "waiting" | "unloading" | "completed";
+}
+
+export interface OperationalSnapshot {
+  simulationHour: number;
+  ports: Array<{
+    portId: string;
+    capacityContainersPerHour: number;
+    activeDisruptions: Port["activeDisruptions"];
+    waitingVesselIds: string[];
+    berthAssignments: Array<{ berthId: string; vesselId: string }>;
+    containersUnloadedThisStep: number;
+  }>;
+  vessels: Array<{
+    vesselId: string;
+    portId: string;
+    status: "scheduled" | "waiting" | "berthed" | "departed";
+    arrivalHour: number;
+    berthId: string | null;
+    berthAtHour: number | null;
+    departureHour: number | null;
+  }>;
+  cargoBatches: CargoBatchSnapshot[];
+  completedCargoBatchIds: string[];
+  cargoAtRisk: Array<{ batchId: string; vesselId: string; containersRemaining: number; deadlinePassed: boolean }>;
+}
+
+export interface SimulationReplay {
+  seed: number;
+  sampleRunIndex: number;
+  timeStepHours: number;
+  snapshots: OperationalSnapshot[];
 }
 
 export interface JevSelection {

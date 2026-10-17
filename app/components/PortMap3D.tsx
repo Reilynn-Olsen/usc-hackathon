@@ -15,14 +15,12 @@ type Props = {
   scenarioId?: ScenarioId;
   command?: MapCommand;
   compact?: boolean;
-  simulationHour?: number;
 };
 
 type MapApi = {
   command: (command: MapCommand) => void;
   setWeather: (weather: WeatherArea, simulated: boolean) => void;
   setSelected: (shipId: string) => void;
-  setHour: (hour: number) => void;
   destroy: () => void;
 };
 
@@ -44,7 +42,7 @@ async function getThree(): Promise<any> {
 
 const point = (THREE: any, x: number, z: number, y = 1.4) => new THREE.Vector3(x, y, z);
 
-export default function PortMap3D({ selectedShip, onSelectShip, weather, simulated = false, scenarioId, command, compact = false, simulationHour = 0 }: Props) {
+export default function PortMap3D({ selectedShip, onSelectShip, weather, simulated = false, scenarioId, command, compact = false }: Props) {
   const rootRef = useRef<HTMLDivElement>(null);
   const apiRef = useRef<MapApi | null>(null);
 
@@ -350,13 +348,10 @@ export default function PortMap3D({ selectedShip, onSelectShip, weather, simulat
         resize();
         const projected = new THREE.Vector3();
         let frame = 0;
-        let targetHour = simulationHour;
-        let smoothHour = simulationHour;
         let raf = 0;
         const animate = () => {
           raf = requestAnimationFrame(animate);
           frame++;
-          smoothHour += (targetHour - smoothHour) * 0.07;
           smoothRadius += (radius - smoothRadius) * 0.075;
           currentTarget.lerp(desiredTarget, 0.075);
           const horizontal = smoothRadius * Math.sin(polar);
@@ -365,7 +360,7 @@ export default function PortMap3D({ selectedShip, onSelectShip, weather, simulat
           camera.lookAt(currentTarget);
           for (let i = 0; i < vesselObjects.length; i++) {
             const vessel = vesselObjects[i];
-            const p = Math.min(0.975, vessel.baseProgress + (simulated ? smoothHour * (i % 3 === 0 ? 0.011 : 0.007) : 0) + Math.sin(frame * 0.0011 + i) * 0.0014);
+            const p = Math.min(0.975, vessel.baseProgress + Math.sin(frame * 0.0011 + i) * 0.0014);
             const world = vessel.curve.getPointAt(p);
             const tangent = vessel.curve.getTangentAt(p);
             vessel.mesh.position.copy(world);
@@ -388,7 +383,7 @@ export default function PortMap3D({ selectedShip, onSelectShip, weather, simulat
         };
         animate();
 
-        apiRef.current = { command: applyCommand, setWeather: updateWeather, setSelected, setHour: (hour: number) => { targetHour = hour; }, destroy: () => {
+        apiRef.current = { command: applyCommand, setWeather: updateWeather, setSelected, destroy: () => {
           cancelAnimationFrame(raf);
           observer.disconnect();
           renderer.domElement.removeEventListener("pointerdown", onDown);
@@ -418,7 +413,6 @@ export default function PortMap3D({ selectedShip, onSelectShip, weather, simulat
   // Synchronize again when the asynchronous map initialization finishes.
   useEffect(() => { if (ready) apiRef.current?.setWeather(weather, simulated); }, [ready, weather, simulated]);
   useEffect(() => { if (ready) apiRef.current?.setSelected(selectedShip); }, [ready, selectedShip]);
-  useEffect(() => { if (ready) apiRef.current?.setHour(simulationHour); }, [ready, simulationHour]);
   useEffect(() => { if (ready && command) apiRef.current?.command(command); }, [ready, command]);
 
   return (

@@ -3,8 +3,10 @@ import test from "node:test";
 import { createStormScenario } from "../lib/harbormind/demo.ts";
 import { createRecommendation } from "../lib/harbormind/decision.ts";
 import { applyAisPositionReport, applyOpenMeteoForecast } from "../lib/harbormind/adapters.ts";
-import { generateStrategies, simulateStrategy } from "../lib/harbormind/simulation.ts";
+import { generateStrategies, generateStrategyForPlan, simulateStrategy, simulateStrategyWithReplay } from "../lib/harbormind/simulation.ts";
 import { validateSimulationState } from "../lib/harbormind/validate.ts";
+import { SCENARIOS, EMPTY_ACTIONS } from "../app/lib/data.ts";
+import { actionSelectionForStrategy, availableActionsForStrategies, configureScenarioState, isLatestScenarioRequest, scenarioSignature, toggleAction } from "../app/lib/scenario.ts";
 import { GET as getScenario } from "../app/api/scenario/route.ts";
 import { POST as postStrategies } from "../app/api/strategies/route.ts";
 import { POST as postSimulation } from "../app/api/simulate/route.ts";
@@ -12,6 +14,33 @@ import { POST as postRecommendation } from "../app/api/recommendation/route.ts";
 
 const startAt = "2026-10-16T12:00:00.000Z";
 const scenario = () => createStormScenario(startAt);
+function cargoOperationsState() {
+  const state = scenario();
+  const port = {
+    ...state.ports[0], currentCapacityContainersPerDay: 12, normalCapacityContainersPerDay: 24,
+    availableBerths: 1, unloadingResources: 1, queueShipIds: ["vessel-a", "vessel-b"],
+    activeDisruptions: [{ id: "fog-18h", description: "Synthetic reduced port throughput", severity: 0.5 }],
+  };
+  const cargo = (source, cargoId, category, containers, essential, deadline) => ({
+    ...source, cargoId, category, containers, essential, deadline, delayCostPerContainerHour: 2, specialHandling: [],
+  });
+  const vesselA = {
+    ...state.ships[0], vesselId: "vessel-a", estimatedArrival: startAt, destinationPortId: port.portId,
+    eligibleAlternativePortIds: [], cargo: [
+      cargo(state.ships[0].cargo[0], "retail-batch", "retail", 10, false, "2026-10-16T13:00:00.000Z"),
+      cargo(state.ships[0].cargo[0], "medical-batch", "medical", 2, true, "2026-10-16T16:00:00.000Z"),
+    ],
+  };
+  const vesselB = {
+    ...state.ships[1], vesselId: "vessel-b", estimatedArrival: "2026-10-16T18:00:00.000Z", destinationPortId: port.portId,
+    eligibleAlternativePortIds: [], cargo: [cargo(state.ships[1].cargo[0], "consumer-batch", "consumer", 5, false, "2026-10-16T13:00:00.000Z")],
+  };
+  state.ports = [port];
+  state.ships = [vesselA, vesselB];
+  state.weather = [];
+  return state;
+}
+const cargoOperationsOptions = { runs: 1, seed: 42, horizonHours: 18, timeStepHours: 1, maxArrivalDelayHours: 0, weatherSeverityVariation: 0, capacityReductionVariation: 0, unloadingTimeVariation: 0, equipmentFailureProbability: 0 };
 const validReply = (state, strategyId) => ({
   model: "test-jev",
   selection: { choice: strategyId, confidence: 0.8, probabilities: Object.fromEntries(generateStrategies(state).map((strategy) => [strategy.id, strategy.id === strategyId ? 0.8 : 0.2 / (generateStrategies(state).length - 1)])) },
@@ -45,7 +74,46 @@ test("simulated throughput respects port capacity and fixed seed repeats exactly
   assert.equal(simulateStrategy(state, baseline, options).mean.estimatedDelayCost, null);
 });
 
-test("rerouting is offered only for an explicitly eligible and sufficiently modeled alternative", () => {
+test("hourly cargo replay unloads urgent batches ahead of earlier manifest items under berth and throughput limits", () => {
+  const state = cargoOperationsState();
+  assert.deepEqual(validateSimulationState(state).errors, []);
+  const strategies = generateStrategies(state);
+  const baseline = strategies.find((item) => item.id === "baseline-arrival-order");
+  const prioritized = strategies.find((item) => item.id === "critical-cargo-first");
+  const baseResult = simulateStrategyWithReplay(state, baseline, cargoOperationsOptions);
+  const priorityResult = simulateStrategyWithReplay(state, prioritized, cargoOperationsOptions);
+  const snapshots = priorityResult.replay.snapshots;
+  const hourTwo = snapshots.find((item) => item.simulationHour === 2);
+
+  assert.equal(hourTwo.cargoBatches.find((item) => item.batchId === "medical-batch").containersUnloaded, 1);
+  assert.equal(hourTwo.cargoBatches.find((item) => item.batchId === "retail-batch").containersUnloaded, 0);
+  assert.equal(hourTwo.ports[0].capacityContainersPerHour, 0.5);
+  assert.equal(hourTwo.ports[0].activeDisruptions[0].id, "fog-18h");
+  assert.equal(baseResult.replay.snapshots.find((item) => item.simulationHour === 2).cargoBatches.find((item) => item.batchId === "retail-batch").containersUnloaded, 1);
+  assert.equal(snapshots.find((item) => item.simulationHour === 4).cargoBatches.find((item) => item.batchId === "medical-batch").status, "completed");
+  assert.equal(snapshots.find((item) => item.simulationHour === 6).vessels.find((item) => item.vesselId === "vessel-b").status, "waiting");
+  assert.equal(snapshots.find((item) => item.simulationHour === 5).cargoBatches.find((item) => item.batchId === "consumer-batch").containersUnloaded, 0);
+
+  for (const snapshot of snapshots) {
+    const berths = snapshot.ports[0].berthAssignments;
+    assert.ok(berths.length <= state.ports[0].availableBerths);
+    assert.equal(new Set(berths.map((item) => item.berthId)).size, berths.length);
+  }
+  const unloaded = snapshots.slice(1).reduce((sum, item) => sum + item.ports[0].containersUnloadedThisStep, 0);
+  assert.ok(unloaded <= state.ports[0].currentCapacityContainersPerDay * cargoOperationsOptions.horizonHours / 24);
+  assert.equal(priorityResult.summary.mean.criticalCargoOnTimePercent, 100);
+  assert.equal(baseResult.summary.mean.criticalCargoOnTimePercent, 0);
+  assert.notEqual(priorityResult.summary.mean.averageCargoDelayHours, baseResult.summary.mean.averageCargoDelayHours);
+  assert.notEqual(priorityResult.summary.mean.estimatedDelayCost, baseResult.summary.mean.estimatedDelayCost);
+  assert.deepEqual(
+    priorityResult.replay.snapshots[0].vessels.map(({ vesselId, arrivalHour }) => [vesselId, arrivalHour]),
+    baseResult.replay.snapshots[0].vessels.map(({ vesselId, arrivalHour }) => [vesselId, arrivalHour]),
+  );
+  assert.deepEqual(priorityResult.replay.snapshots[0].ports.map(({ portId, capacityContainersPerHour }) => [portId, capacityContainersPerHour]),
+    baseResult.replay.snapshots[0].ports.map(({ portId, capacityContainersPerHour }) => [portId, capacityContainersPerHour]));
+});
+
+test("standard-shipment rerouting excludes essential vessels and requires a feasible modeled alternative", () => {
   const state = scenario();
   const alternative = {
     ...state.ports[0], portId: "port-alternative", location: { name: "Modeled Alternative", latitude: 34, longitude: -119 },
@@ -53,9 +121,11 @@ test("rerouting is offered only for an explicitly eligible and sufficiently mode
   };
   state.ports.push(alternative);
   state.ships[2].eligibleAlternativePortIds = [alternative.portId];
-  assert.ok(generateStrategies(state).some((strategy) => strategy.id === `reroute-northwind-${alternative.portId}`));
-  alternative.currentCapacityContainersPerDay = 1;
   assert.ok(!generateStrategies(state).some((strategy) => strategy.id === `reroute-northwind-${alternative.portId}`));
+  state.ships[0].eligibleAlternativePortIds = [alternative.portId];
+  assert.ok(generateStrategies(state).some((strategy) => strategy.id === `reroute-evergreen-1-${alternative.portId}`));
+  alternative.currentCapacityContainersPerDay = 1;
+  assert.ok(!generateStrategies(state).some((strategy) => strategy.id === `reroute-evergreen-1-${alternative.portId}`));
 });
 
 test("invalid Jev choices and Jev failures fall back to normal arrival-order scheduling", async () => {
@@ -70,6 +140,14 @@ test("invalid Jev choices and Jev failures fall back to normal arrival-order sch
   assert.equal(failed.recommendation.selectedStrategyId, "baseline-arrival-order");
   assert.equal(failed.recommendation.aiGenerated, false);
   assert.match(failed.recommendation.warnings.join(" "), /Jev decision failed/);
+
+  const incomplete = await createRecommendation(state, { runs: 3 }, async () => {
+    const reply = validReply(state, "baseline-arrival-order");
+    delete reply.selection.confidence;
+    return reply;
+  });
+  assert.equal(incomplete.recommendation.decisionSource, "fallback");
+  assert.equal(incomplete.recommendation.jev, null);
 });
 
 test("storm example selects a feasible critical-cargo strategy and beats the baseline", async () => {
@@ -77,6 +155,10 @@ test("storm example selects a feasible critical-cargo strategy and beats the bas
   const selectedId = "dedicated-critical-capacity";
   const result = await createRecommendation(state, { runs: 20, seed: 42 }, async (_state, strategies) => validReply(state, strategies.some((item) => item.id === selectedId) ? selectedId : "baseline-arrival-order"));
   assert.ok(result.strategies.some((strategy) => strategy.id === result.recommendation.selectedStrategyId));
+  assert.equal(result.recommendation.decisionSource, "jev");
+  assert.equal(result.recommendation.aiGenerated, true);
+  assert.equal(result.recommendation.jev.model, "test-jev");
+  assert.deepEqual(result.evaluatedStrategies.find((item) => item.strategy.id === selectedId).outcome, result.recommendation.baselineComparison.selected);
   assert.ok(result.recommendation.baselineComparison.selected.mean.criticalCargoOnTimePercent > result.recommendation.baselineComparison.baseline.mean.criticalCargoOnTimePercent);
   assert.ok(result.recommendation.baselineComparison.criticalCargoOnTimeChangePercent > 0);
   assert.equal(result.recommendation.humanApprovalRequired, true);
@@ -121,6 +203,95 @@ test("live API adapters update only fields provided by Open-Meteo and AISStream"
   assert.equal(position.provenance.shipPositions, "mixed");
 });
 
+test("scenario controls produce backend input and action cards reflect feasible strategies", () => {
+  const state = scenario();
+  const fog = configureScenarioState(state, SCENARIOS.find((item) => item.id === "fog"), 35);
+  assert.deepEqual(validateSimulationState(fog).errors, []);
+  assert.equal(fog.scenarioId, "fog");
+  assert.equal(fog.ports[0].currentCapacityContainersPerDay, 156);
+  assert.equal(fog.ports[0].activeDisruptions[0].severity, 0.35);
+  assert.deepEqual(fog.weather, []);
+  assert.equal(fog.provenance.weather, "unavailable");
+  assert.notEqual(scenarioSignature("storm", 60, 12), scenarioSignature("fog", 35, 12));
+
+  const strategies = generateStrategies(state);
+  assert.deepEqual(availableActionsForStrategies(strategies), { critical: true, stagger: true, trucks: true, divert: false });
+  const recommended = actionSelectionForStrategy(strategies.find((item) => item.id === "dedicated-critical-capacity"));
+  assert.deepEqual(recommended, { critical: true, stagger: false, trucks: true, divert: false });
+  assert.deepEqual(toggleAction(toggleAction(EMPTY_ACTIONS, "critical", true), "critical", false), EMPTY_ACTIONS);
+  const reserved = toggleAction(EMPTY_ACTIONS, "trucks", true);
+  assert.equal(reserved.critical, true);
+  assert.equal(toggleAction(reserved, "critical", false).trucks, false);
+
+  const controller = new AbortController();
+  assert.equal(isLatestScenarioRequest(2, 2, controller, controller), true);
+  assert.equal(isLatestScenarioRequest(1, 2, controller, controller), false);
+  controller.abort();
+  assert.equal(isLatestScenarioRequest(2, 2, controller, controller), false);
+});
+
+test("dense fog recommendation and plan evaluation use the same horizon, seed, and baseline", async () => {
+  const fog = configureScenarioState(scenario(), SCENARIOS.find((item) => item.id === "fog"), 35);
+  const options = { runs: 8, seed: 42, horizonHours: 36 };
+  const result = await createRecommendation(fog, options, async () => validReply(fog, "stage-lower-priority"));
+  assert.equal(result.recommendation.decisionSource, "jev");
+  assert.equal(result.recommendation.estimatedOutcomes.horizonHours, 36);
+
+  const response = await postSimulation(new Request("http://localhost/api/simulate", {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ state: fog, options, strategyId: result.recommendation.selectedStrategyId }),
+  }));
+  const evaluated = await response.json();
+  assert.equal(response.status, 200);
+  assert.deepEqual(evaluated.outcome, result.recommendation.estimatedOutcomes);
+  assert.deepEqual(evaluated.baseline, result.recommendation.baselineComparison.baseline);
+  assert.equal(evaluated.replay.sampleRunIndex, 0);
+  assert.equal(evaluated.replay.snapshots.length, 37);
+  assert.equal(evaluated.replay.snapshots.at(-1).simulationHour, 36);
+});
+
+test("combined recovery actions are validated and use the same seeded baseline simulation", async () => {
+  const state = scenario();
+  const options = { runs: 5, seed: 9, horizonHours: 24 };
+  const plan = { prioritizeCriticalCargo: true, staggerLowerPriorityVessels: true, reserveCapacityForCriticalCargo: true, divertStandardShipment: false };
+  const response = await postSimulation(new Request("http://localhost/api/simulate", {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ state, options, plan }),
+  }));
+  const result = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(result.strategy.scheduling, "critical-first");
+  assert.equal(result.strategy.holdNonessentialHours, 8);
+  assert.equal(result.strategy.resourceMode, "dedicated-priority");
+  assert.equal(result.outcome.runs, options.runs);
+  assert.equal(result.outcome.seed, options.seed);
+  assert.equal(result.outcome.horizonHours, options.horizonHours);
+  assert.deepEqual(result.baseline, simulateStrategy(state, generateStrategies(state)[0], options));
+
+  const infeasible = await postSimulation(new Request("http://localhost/api/simulate", {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ state, options, plan: { ...plan, divertStandardShipment: true } }),
+  }));
+  assert.equal(infeasible.status, 422);
+  const invalidCombination = await postSimulation(new Request("http://localhost/api/simulate", {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ state, options, plan: { ...plan, prioritizeCriticalCargo: false } }),
+  }));
+  assert.equal(invalidCombination.status, 422);
+  assert.match((await invalidCombination.json()).error, /not feasible/);
+});
+
+test("a selected action may perform worse than baseline and the simulator returns the loss", () => {
+  const state = scenario();
+  for (const ship of state.ships) for (const cargo of ship.cargo) {
+    cargo.essential = false;
+    cargo.deadline = "2026-10-16T13:00:00.000Z";
+  }
+  const strategies = generateStrategies(state);
+  const baseline = strategies.find((item) => item.id === "baseline-arrival-order");
+  const stagger = generateStrategyForPlan(state, { prioritizeCriticalCargo: false, staggerLowerPriorityVessels: true, reserveCapacityForCriticalCargo: false, divertStandardShipment: false });
+  const baselineOutcome = simulateStrategy(state, baseline, { runs: 20, seed: 42, horizonHours: 72 });
+  const staggerOutcome = simulateStrategy(state, stagger, { runs: 20, seed: 42, horizonHours: 72 });
+  assert.ok(staggerOutcome.mean.averageCargoDelayHours > baselineOutcome.mean.averageCargoDelayHours);
+  assert.ok(staggerOutcome.mean.totalContainersProcessed < baselineOutcome.mean.totalContainersProcessed);
+});
+
 test("scenario and strategy API routes expose the example and reject bad input", async () => {
   const response = await getScenario();
   const state = await response.json();
@@ -137,6 +308,8 @@ test("scenario and strategy API routes expose the example and reject bad input",
 
   const invalid = await postStrategies(new Request("http://localhost/api/strategies", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" }));
   assert.equal(invalid.status, 400);
+  const invalidStep = await postStrategies(new Request("http://localhost/api/strategies", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ state, options: { timeStepHours: 0 } }) }));
+  assert.equal(invalidStep.status, 400);
 });
 
 test("recommendation route returns the complete baseline fallback when Jev has no key", async () => {
@@ -156,6 +329,9 @@ test("recommendation route returns the complete baseline fallback when Jev has n
     assert.equal(result.recommendation.simulatedOutcomeLikelihoods.seed, 12);
     assert.equal(result.recommendation.humanApprovalRequired, true);
     assert.ok(result.recommendation.baselineComparison.baseline.mean.criticalCargoOnTimePercent >= 0);
+    assert.ok(result.availableStrategies.some((strategy) => strategy.id === result.recommendation.selectedStrategyId));
+    assert.equal(result.evaluatedStrategies.length, result.availableStrategies.length);
+    assert.ok(result.evaluatedStrategies.every((entry) => entry.outcome.runs === 3 && typeof entry.outcome.probabilityOfMeetingTarget === "number"));
   } finally {
     if (saved.key === undefined) delete process.env.TYPESAFE_API_KEY;
     else process.env.TYPESAFE_API_KEY = saved.key;
