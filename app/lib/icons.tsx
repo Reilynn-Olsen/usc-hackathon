@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 
-type IconName = "grid" | "flask" | "info" | "ship" | "storm" | "fog" | "wind" | "outage" | "arrow" | "chevron" | "clock" | "shield" | "check" | "reset" | "play" | "sparkle" | "layers" | "route" | "anchor" | "alert" | "close" | "minus" | "plus" | "back" | "settings" | "trend" | "box" | "target" | "pause" | "globe" | "menu";
+type IconName = "grid" | "flask" | "info" | "ship" | "storm" | "fog" | "wind" | "outage" | "arrow" | "chevron" | "clock" | "shield" | "check" | "reset" | "play" | "sparkle" | "layers" | "route" | "anchor" | "alert" | "close" | "minus" | "plus" | "back" | "settings" | "trend" | "box" | "target" | "pause" | "globe" | "menu" | "github";
 
 export function Icon({ name, size = 18, strokeWidth = 1.8, className = "" }: { name: IconName; size?: number; strokeWidth?: number; className?: string }) {
   const paths: Record<IconName, ReactNode> = {
@@ -35,6 +35,9 @@ export function Icon({ name, size = 18, strokeWidth = 1.8, className = "" }: { n
     pause: <><path d="M8 5v14M16 5v14"/></>,
     globe: <><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a15 15 0 0 1 0 18M12 3a15 15 0 0 0 0 18"/></>,
     menu: <path d="M4 6h16M4 12h16M4 18h16"/>,
+    github: (
+      <path d="M9 19c-4.3 1.3-4.3-2.2-6-2.7m12 5.7v-3.9a3.4 3.4 0 0 0-.9-2.7c3-.3 6.2-1.5 6.2-6.9a5.4 5.4 0 0 0-1.5-3.7 5 5 0 0 0-.1-3.7S17.5.8 15 2.5a12.8 12.8 0 0 0-6 0C6.5.8 5.3 1.1 5.3 1.1a5 5 0 0 0-.1 3.7 5.4 5.4 0 0 0-1.5 3.7c0 5.4 3.2 6.6 6.2 6.9A3.4 3.4 0 0 0 9 18.1V22" />
+    ),
   };
   return <svg aria-hidden="true" className={className} width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={strokeWidth} strokeLinecap="round" strokeLinejoin="round">{paths[name]}</svg>;
 }
