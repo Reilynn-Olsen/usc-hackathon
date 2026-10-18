@@ -5,6 +5,7 @@ import type {
   SimulationState,
 } from "../../lib/harbormind/types.ts";
 import type { Ship } from "./data.ts";
+import { berthPosition, waterPosition } from "./port-layout.ts";
 
 export type MapVessel = Omit<Ship, "cargo"> & {
   cargo: string;
@@ -144,7 +145,7 @@ export function vesselsForMap(
     const port =
       state.ports.find((item) => item.portId === ship.destinationPortId) ??
       state.ports[0];
-    const initial = projectPosition(ship.position, port);
+    const initial = waterPosition(projectPosition(ship.position, port));
     const operation = snapshot?.vessels.find(
       (item) => item.vesselId === ship.vesselId,
     );
@@ -156,8 +157,8 @@ export function vesselsForMap(
           .find((item) => item.portId === operation.portId)
           ?.waitingVesselIds.indexOf(ship.vesselId) ?? index;
       const waiting: [number, number] = [
-        -12 - Math.floor(Math.max(0, waitingIndex) / 6) * 10,
-        -40 + (Math.max(0, waitingIndex) % 6) * 16,
+        -12 - Math.floor((waitingIndex >= 0 ? waitingIndex : index) / 6) * 13,
+        -40 + ((waitingIndex >= 0 ? waitingIndex : index) % 6) * 16,
       ];
       if (operation.status === "scheduled") {
         const progress = Math.min(
@@ -177,14 +178,7 @@ export function vesselsForMap(
               (item) => item.vesselId === ship.vesselId,
             ) ?? 0;
         const berthNumber = Number(operation.berthId?.match(/(\d+)$/)?.[1]);
-        position = [
-          23,
-          -36 +
-            ((berthNumber > 0 ? berthNumber - 1 : Math.max(0, berthIndex)) %
-              5) *
-              17 -
-            4,
-        ];
+        position = berthPosition(berthNumber > 0 ? berthNumber - 1 : Math.max(0, berthIndex));
         heading = 90;
       } else {
         position = [

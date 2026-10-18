@@ -472,6 +472,20 @@ function simulateRun(
   const activeDisruptionsAt = (port: SimulationState["ports"][number], hour: number) => port.activeDisruptions
     .filter((disruption) => disruption.startHour <= hour && hour < disruption.startHour + disruption.durationHours);
 
+  const closedBerthsAt = (port: SimulationState["ports"][number], hour: number) => new Set(
+    activeDisruptionsAt(port, hour).filter((disruption) => disruption.severity > 0).flatMap((disruption) => disruption.closedBerthIds ?? []),
+  );
+  const clearClosedBerths = (hour: number) => {
+    for (const port of state.ports) {
+      const closed = closedBerthsAt(port, hour);
+      for (const job of jobs) if (job.portId === port.portId && job.berthId && closed.has(job.berthId)) {
+        job.status = "waiting";
+        job.berthId = null;
+        job.berthAtHour = null;
+      }
+    }
+  };
+
   const effectiveCapacityPerHour = (portId: string, hour: number) => {
     const port = state.ports.find((item) => item.portId === portId)!;
     const factors = portFactors.get(portId)!;
@@ -527,6 +541,7 @@ function simulateRun(
     const endHour = Math.min(options.horizonHours, startHour + options.timeStepHours);
     const elapsedHours = endHour - startHour;
     updateArrivals(startHour);
+    clearClosedBerths(startHour);
     const unloadedByPort = new Map<string, number>();
     const unloadingVesselIds = new Set<string>();
 
@@ -537,12 +552,14 @@ function simulateRun(
       const hourlyCapacity = elapsedHours ? intervalCapacity / elapsedHours : 0;
       nominalCapacity += intervalCapacity;
       const portJobs = jobs.filter((job) => job.portId === port.portId);
+      const closedBerths = closedBerthsAt(port, startHour);
+      const openBerthCount = Math.max(0, port.availableBerths - closedBerths.size);
       const freeBerthIds = Array.from({ length: Math.max(0, port.availableBerths) }, (_, index) => `${port.portId}-berth-${index + 1}`)
-        .filter((berthId) => !portJobs.some((job) => job.berthId === berthId));
+        .filter((berthId) => !closedBerths.has(berthId) && !portJobs.some((job) => job.berthId === berthId));
       const criticalPending = activeStrategy.reserveBerthForCriticalCargo && portJobs.some((job) => job.status !== "departed" && hasRemainingCriticalCargo(job));
       const criticalAlreadyBerthed = portJobs.some((job) => job.status === "berthed" && hasRemainingCriticalCargo(job));
       const reserveCriticalBerth = criticalPending && !criticalAlreadyBerthed;
-      const noncriticalBerthLimit = reserveCriticalBerth ? Math.max(0, port.availableBerths - 1) : port.availableBerths;
+      const noncriticalBerthLimit = reserveCriticalBerth ? Math.max(0, openBerthCount - 1) : openBerthCount;
       let noncriticalBerthed = portJobs.filter((job) => job.status === "berthed" && !hasRemainingCriticalCargo(job)).length;
       const waiting = portJobs.filter((job) => job.status === "waiting" && job.eligibleHour <= startHour)
         .sort((left, right) => orderIndex.get(left.ship.vesselId)! - orderIndex.get(right.ship.vesselId)!);
@@ -559,7 +576,7 @@ function simulateRun(
       const berthed = portJobs.filter((job) => job.status === "berthed" && hasRemainingCargo(job))
         .sort((left, right) => orderIndex.get(left.ship.vesselId)! - orderIndex.get(right.ship.vesselId)!);
       const criticalBerthed = berthed.filter(hasRemainingCriticalCargo);
-      const unloadingSlots = Math.min(factors.availableUnloadingResources, port.availableBerths);
+      const unloadingSlots = Math.min(factors.availableUnloadingResources, openBerthCount);
       const unloading = unloadingSlots > 0 && activeStrategy.reserveBerthForCriticalCargo && criticalBerthed.length
         ? [...criticalBerthed.slice(0, 1), ...berthed.filter((job) => job !== criticalBerthed[0]).slice(0, Math.max(0, unloadingSlots - 1))]
         : berthed.slice(0, unloadingSlots);
@@ -638,6 +655,7 @@ function simulateRun(
     }
 
     updateArrivals(endHour);
+    clearClosedBerths(endHour);
     captureSnapshot(endHour, unloadedByPort, unloadingVesselIds);
     if (stopAtHour !== undefined && endHour >= stopAtHour) return {
       metrics: {

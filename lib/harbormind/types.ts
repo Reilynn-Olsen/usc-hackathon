@@ -13,6 +13,7 @@ export interface Cargo {
 }
 
 export interface PortDisruption {
+  closedBerthIds?: string[];
   id: string;
   description: string;
   severity: number;

@@ -11,6 +11,7 @@ import {
 import {
   generateStrategies,
   simulateStrategyWithReplay,
+  simulateStrategy,
 } from "../lib/harbormind/simulation.ts";
 
 const start = "2026-10-17T12:00:00.000Z";
@@ -152,5 +153,58 @@ test("AIS fleet submitted to the simulation API is the fleet rendered throughout
       assert.equal(vessels.reduce((sum, ship) => sum + ship.containers, 0),
         snapshot.cargoBatches.reduce((sum, batch) => sum + batch.containersRemaining, 0));
     }
+  }
+});
+
+
+test("schematic approach ships clear the piers and berthed hulls fit alongside them", async () => {
+  const { PIER_Z, PIER_HALF_WIDTH, SHIP_HALF_LENGTH, SHIP_HALF_WIDTH, berthPosition } = await import("../app/lib/port-layout.ts");
+  const state = createStormScenario(start);
+  const original = structuredClone(state.ships.map((ship) => ship.position));
+  const approaches = vesselsForMap(state);
+  for (const ship of approaches) assert.ok(ship.mapPosition[0] + SHIP_HALF_LENGTH < 9);
+  assert.deepEqual(state.ships.map((ship) => ship.position), original);
+  for (let index = 0; index < PIER_Z.length; index++) {
+    const [x, z] = berthPosition(index);
+    assert.ok(x + SHIP_HALF_LENGTH < 33, "Hull clears the shore");
+    for (const pier of PIER_Z) assert.ok(Math.abs(z - pier) > SHIP_HALF_WIDTH + PIER_HALF_WIDTH, "Hull clears every pier");
+  }
+});
+
+test("equipment failure closes affected berths in replay and reopens them after repair", async () => {
+  const { configureScenarioState } = await import("../app/lib/scenario.ts");
+  const { SCENARIOS } = await import("../app/lib/data.ts");
+  const { berthIntersectsArea } = await import("../app/lib/port-layout.ts");
+  const outage = SCENARIOS.find((item) => item.id === "outage");
+  const options = { runs: 1, seed: 42, horizonHours: 8, maxArrivalDelayHours: 0, capacityReductionVariation: 0, unloadingTimeVariation: 0, equipmentFailureProbability: 0 };
+  for (const startHour of [0, 2]) {
+    const state = configureScenarioState(createStormScenario(start), outage, 50, 3);
+    state.ports[0].activeDisruptions[0].startHour = startHour;
+    for (const ship of state.ships) {
+      ship.estimatedArrival = start;
+      for (const cargo of ship.cargo) cargo.containers = 1000;
+    }
+    const closed = state.ports[0].activeDisruptions[0].closedBerthIds;
+    assert.deepEqual(closed, [`${state.ports[0].portId}-berth-2`]);
+    assert.deepEqual(validateSimulationState(state).errors, []);
+    const strategy = generateStrategies(state)[0];
+    const { replay, summary } = simulateStrategyWithReplay(state, strategy, options);
+    assert.deepEqual(summary, simulateStrategy(state, strategy, options));
+    for (const snapshot of replay.snapshots) {
+      if (snapshot.simulationHour >= startHour && snapshot.simulationHour < startHour + 3) {
+        assert.ok(snapshot.ports[0].berthAssignments.every((item) => !closed.includes(item.berthId)));
+        for (const vessel of snapshot.vessels.filter((item) => item.status === "berthed")) {
+          const index = Number(vessel.berthId.match(/(\d+)$/)[1]) - 1;
+          assert.equal(berthIntersectsArea(index, outage.zone), false);
+        }
+      }
+      const remaining = snapshot.cargoBatches.reduce((sum, batch) => sum + batch.containersRemaining, 0);
+      const unloaded = snapshot.cargoBatches.reduce((sum, batch) => sum + batch.containersUnloaded, 0);
+      assert.equal(remaining + unloaded, 4000, "A berth closure preserves cargo progress");
+    }
+    assert.ok(replay.snapshots.some((snapshot) => snapshot.simulationHour > startHour + 3 && snapshot.ports[0].berthAssignments.some((item) => closed.includes(item.berthId))));
+    if (startHour > 0) assert.ok(replay.snapshots.find((snapshot) => snapshot.simulationHour === 1).ports[0].berthAssignments.some((item) => closed.includes(item.berthId)));
+    state.ports[0].activeDisruptions[0].closedBerthIds = ["unknown-berth"];
+    assert.ok(validateSimulationState(state).errors.length > 0);
   }
 });
