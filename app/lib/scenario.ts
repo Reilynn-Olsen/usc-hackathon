@@ -1,5 +1,6 @@
 import type { OperationalSnapshot, RecoveryPlan, RecoveryStrategy, SimulationReplay, SimulationState } from "../../lib/harbormind/types.ts";
 import type { Scenario, ScenarioId } from "./data.ts";
+import { berthIntersectsArea } from "./port-layout.ts";
 
 export function configureScenarioState(state: SimulationState, scenario: Scenario, capacityLoss: number, durationHours = 18): SimulationState {
   const isStorm = scenario.id === "storm";
@@ -8,7 +9,11 @@ export function configureScenarioState(state: SimulationState, scenario: Scenari
     scenarioId: scenario.id,
     ports: state.ports.map((port) => ({
       ...port,
-      activeDisruptions: [{ id: `${scenario.id}-capacity-loss`, description: `${scenario.label}: ${scenario.description}`, severity: capacityLoss / 100, startHour: 0, durationHours }],
+      activeDisruptions: [{ id: `${scenario.id}-capacity-loss`, description: `${scenario.label}: ${scenario.description}`, severity: capacityLoss / 100, startHour: 0, durationHours,
+        ...(scenario.id === "outage" ? { closedBerthIds: Array.from({ length: port.availableBerths }, (_, index) => index)
+          .filter((index) => berthIntersectsArea(index, scenario.zone))
+          .map((index) => `${port.portId}-berth-${index + 1}`) } : {}),
+      }],
     })),
     ...(isStorm ? {} : {
       weather: [],

@@ -53,3 +53,8 @@ a.team-profile:focus-visible { outline: 2px solid var(--teal); outline-offset: 4
 @media (max-width: 600px) {
   .team-profiles:not(.team-profiles--compact) { grid-template-columns: 1fr; }
 }
+
+.map-weather-key { position: absolute; right: 16px; bottom: 65px; z-index: 4; display: flex; align-items: center; gap: 9px; max-width: calc(100% - 32px); padding: 9px 11px; border: 1px solid #56717b80; border-radius: 5px; background: #0c202ceb; color: #d5e4ea; pointer-events: none; font: 600 10px var(--body); box-shadow: 0 4px 16px #04101944; }
+.map-weather-key > svg { flex: none; color: #e8b66f; }
+.map-weather-key small { display: block; margin-top: 4px; color: #8faab8; font: 500 7px var(--mono); letter-spacing: .6px; }
+.port-map-root--compact .map-weather-key { bottom: 45px; }

@@ -2,47 +2,43 @@
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { useEffect, useRef, useState } from "react";
-import { SHIPS, type Ship, type ScenarioId } from "../lib/data";
+import type { ScenarioId } from "../lib/data";
+import type { MapVessel } from "../lib/vessel-state";
 import { Icon } from "../lib/icons";
+import { PIER_Z } from "../lib/port-layout";
 
 export type MapCommand = { kind: "reset" | "zoomIn" | "zoomOut" | "focusShip" | "focusPort"; shipId?: string; nonce: number };
 type WeatherArea = { x: number; z: number; radius: number; color: string };
 type Props = {
+  vessels: MapVessel[];
+  berthCount?: number;
   selectedShip: string;
   onSelectShip: (id: string) => void;
   weather: WeatherArea;
   simulated?: boolean;
+  weatherStrength?: number;
+  weatherActive?: boolean;
   scenarioId?: ScenarioId;
   command?: MapCommand;
   compact?: boolean;
 };
 
 type MapApi = {
+  setBerthCount: (count: number) => void;
+  setVessels: (vessels: MapVessel[]) => void;
   command: (command: MapCommand) => void;
-  setWeather: (weather: WeatherArea, simulated: boolean) => void;
+  setWeather: (weather: WeatherArea, strength: number, active: boolean, kind?: ScenarioId) => void;
   setSelected: (shipId: string) => void;
   destroy: () => void;
 };
 
-const CDNS = [
-  "https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.module.js",
-  "https://unpkg.com/three@0.180.0/build/three.module.js",
-];
-
-async function getThree(): Promise<any> {
-  // The browser imports Three.js directly so this drop-in only changes /app.
-  // To bundle locally later: npm install three, then replace this with import("three").
-  const browserImport = new Function("url", "return import(url)") as (url: string) => Promise<any>;
-  let lastError: unknown;
-  for (const url of CDNS) {
-    try { return await browserImport(url); } catch (error) { lastError = error; }
-  }
-  throw lastError;
+async function getThree() {
+  return import("three");
 }
 
 const point = (THREE: any, x: number, z: number, y = 1.4) => new THREE.Vector3(x, y, z);
 
-export default function PortMap3D({ selectedShip, onSelectShip, weather, simulated = false, scenarioId, command, compact = false }: Props) {
+export default function PortMap3D({ vessels, berthCount = PIER_Z.length, selectedShip, onSelectShip, weather, simulated = false, weatherStrength = 0.45, weatherActive = true, scenarioId, command, compact = false }: Props) {
   const rootRef = useRef<HTMLDivElement>(null);
   const apiRef = useRef<MapApi | null>(null);
 
@@ -130,7 +126,7 @@ export default function PortMap3D({ selectedShip, onSelectShip, weather, simulat
             land.add(stack);
           }
         }
-        for (const z of [-36, -19, -2, 15, 32]) {
+        for (const z of PIER_Z) {
           const pier = new THREE.Mesh(new THREE.BoxGeometry(27, 1.45, 5.1), makeMat("#597480"));
           pier.position.set(22.5, 0.22, z);
           land.add(pier);
@@ -163,22 +159,59 @@ export default function PortMap3D({ selectedShip, onSelectShip, weather, simulat
           scene.add(marker);
         }
 
-        const routeObjects: any[] = [];
-        const vesselObjects: { mesh: any; ship: Ship; curve: any; baseProgress: number; glow: any }[] = [];
+        const makeWarningMarker = (color: string) => {
+          const warning = new THREE.Group();
+          warning.position.y = 15;
+          const triangle = new THREE.Shape();
+          triangle.moveTo(0, 4.8);
+          triangle.lineTo(-5, -3.8);
+          triangle.lineTo(5, -3.8);
+          triangle.closePath();
+          warning.add(new THREE.Mesh(new THREE.ShapeGeometry(triangle), new THREE.MeshBasicMaterial({ color: "#512626", side: THREE.DoubleSide })));
+          const outline = new THREE.Line(new THREE.BufferGeometry().setFromPoints([
+            new THREE.Vector3(0, 4.8, 0.1), new THREE.Vector3(-5, -3.8, 0.1),
+            new THREE.Vector3(5, -3.8, 0.1), new THREE.Vector3(0, 4.8, 0.1),
+          ]), new THREE.LineBasicMaterial({ color: "#ffb878" }));
+          warning.add(outline);
+          const bar = new THREE.Mesh(new THREE.BoxGeometry(0.8, 3.5, 0.3), new THREE.MeshBasicMaterial({ color: "#ffd598" }));
+          bar.position.set(0, 0.5, 0.3);
+          warning.add(bar);
+          const dot = new THREE.Mesh(new THREE.SphereGeometry(0.46, 12, 8), new THREE.MeshBasicMaterial({ color: "#ffd598" }));
+          dot.position.set(0, -2.3, 0.3);
+          warning.add(dot);
+          const post = new THREE.Line(new THREE.BufferGeometry().setFromPoints([
+            new THREE.Vector3(0, 1.5, 0), new THREE.Vector3(0, 10.5, 0),
+          ]), new THREE.LineDashedMaterial({ color, dashSize: 0.7, gapSize: 0.5 }));
+          post.computeLineDistances();
+          const marker = new THREE.Group();
+          marker.add(post, warning);
+          return { marker, warning };
+        };
+
+        // Piers outside the modeled berth capacity stay visibly unavailable.
+        const unusedPierWarnings = PIER_Z.map((z) => {
+          const { marker, warning } = makeWarningMarker("#e4777a");
+          marker.position.set(23, 0, z);
+          scene.add(marker);
+          return { marker, warning };
+        });
+        const setBerthCount = (count: number) => {
+          for (const [index, { marker }] of unusedPierWarnings.entries()) {
+            marker.visible = index >= Math.max(0, count);
+          }
+        };
+        setBerthCount(berthCount);
+
+        const vesselObjects: { mesh: any; ship: MapVessel; track: any; glow: any }[] = [];
         const selectable: any[] = [];
         const labelElements: { element: HTMLButtonElement; point: any; id: string }[] = [];
         const labelsLayer = document.createElement("div");
         labelsLayer.className = "port-map-labels";
         root.appendChild(labelsLayer);
 
-        const addShip = (ship: Ship) => {
-          const route = new THREE.CatmullRomCurve3(ship.route.map(([x, z]) => point(THREE, x, z, 0.35)), false, "catmullrom", 0.5);
-          const pts = route.getPoints(110);
-          const routeGeometry = new THREE.BufferGeometry().setFromPoints(pts);
-          const track = new THREE.Line(routeGeometry, new THREE.LineDashedMaterial({ color: ship.priority === "Critical" ? "#5dd7ca" : "#50798e", dashSize: 1.4, gapSize: 0.85, transparent: true, opacity: ship.priority === "Critical" ? 0.95 : 0.75 }));
-          track.computeLineDistances();
+        const addShip = (ship: MapVessel) => {
+          const track = new THREE.Line(new THREE.BufferGeometry(), new THREE.LineDashedMaterial({ color: ship.color, dashSize: 1.4, gapSize: 0.85, transparent: true, opacity: 0.55 }));
           scene.add(track);
-          routeObjects.push(track);
           const group = new THREE.Group();
           group.userData.shipId = ship.id;
           const hull = new THREE.Mesh(new THREE.BoxGeometry(7.7, 1.42, 2.75), makeMat("#aac3c9", { metalness: 0.42, roughness: 0.44 }));
@@ -213,8 +246,8 @@ export default function PortMap3D({ selectedShip, onSelectShip, weather, simulat
           halo.position.y = 0.14;
           group.add(halo);
           scene.add(group);
-          group.traverse((child: any) => { if (child.isMesh) { child.userData.shipId = ship.id; selectable.push(child); } });
-          vesselObjects.push({ mesh: group, ship, curve: route, baseProgress: ship.progress, glow: halo });
+          group.traverse((child: any) => { if (child.isMesh) { child.userData.shipId = ship.id; } });
+          vesselObjects.push({ mesh: group, ship, track, glow: halo });
           const label = document.createElement("button");
           label.type = "button";
           label.className = "ship-map-label";
@@ -228,39 +261,177 @@ export default function PortMap3D({ selectedShip, onSelectShip, weather, simulat
           labelsLayer.appendChild(label);
           labelElements.push({ element: label, point: new THREE.Vector3(), id: ship.id });
         };
-        SHIPS.forEach(addShip);
+        const disposeObject = (object: any) => {
+          scene.remove(object);
+          object.traverse((child: any) => {
+            child.geometry?.dispose();
+            if (Array.isArray(child.material)) child.material.forEach((material: any) => material.dispose());
+            else child.material?.dispose();
+          });
+        };
+        const setVessels = (ships: MapVessel[]) => {
+          const ids = new Set(ships.map((ship) => ship.id));
+          for (let index = vesselObjects.length - 1; index >= 0; index--) {
+            const vessel = vesselObjects[index];
+            if (ids.has(vessel.ship.id)) continue;
+            disposeObject(vessel.mesh);
+            disposeObject(vessel.track);
+            labelElements[index].element.remove();
+            labelElements.splice(index, 1);
+            vesselObjects.splice(index, 1);
+          }
+          selectable.length = 0;
+          for (const ship of ships) {
+            let vessel = vesselObjects.find((item) => item.ship.id === ship.id);
+            if (!vessel) { addShip(ship); vessel = vesselObjects[vesselObjects.length - 1]; }
+            vessel.ship = ship;
+            vessel.glow.scale.z = ship.status === "berthed" ? 0.45 : 1;
+            vessel.mesh.position.set(ship.mapPosition[0], 0.68, ship.mapPosition[1]);
+            vessel.mesh.rotation.y = (90 - ship.mapHeading) * Math.PI / 180;
+            vessel.track.geometry.dispose();
+            vessel.track.geometry = new THREE.BufferGeometry().setFromPoints(ship.route.map(([x, z]) => point(THREE, x, z, 0.35)));
+            vessel.track.computeLineDistances();
+            vessel.track.visible = ship.route.some(([x, z]) => x !== ship.route[0][0] || z !== ship.route[0][1]);
+            vessel.mesh.traverse((child: any) => { if (child.isMesh) selectable.push(child); });
+            const label = labelElements.find((item) => item.id === ship.id)!;
+            label.element.title = `${ship.name} · ${ship.status} · ${ship.containers} containers`;
+            label.element.children[1].textContent = ship.name;
+          }
+        };
+        setVessels(vessels);
 
         const portLabel = document.createElement("div");
         portLabel.className = "map-port-label";
-        portLabel.innerHTML = `<span class="map-port-label__pin">✦</span><span>PORT OF LOS ANGELES<small>5 ACTIVE TERMINALS</small></span>`;
+        portLabel.innerHTML = `<span class="map-port-label__pin">✦</span><span>PORT OF LOS ANGELES<small>SCHEMATIC HARBOR & VESSEL POSITIONS</small></span>`;
         labelsLayer.appendChild(portLabel);
 
         const weatherGroup = new THREE.Group();
         scene.add(weatherGroup);
-        const updateWeather = (area: WeatherArea, isSimulated: boolean) => {
-          while (weatherGroup.children.length) {
-            const child = weatherGroup.children[0];
-            weatherGroup.remove(child);
+        const weatherMaterials: any[] = [];
+        let equipmentWarning: any = null;
+        const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
+        const updateWeather = (area: WeatherArea, strength: number, active: boolean, kind: ScenarioId = "wind") => {
+          weatherGroup.traverse((child: any) => {
             child.geometry?.dispose();
-            child.material?.dispose();
+            if (Array.isArray(child.material)) child.material.forEach((material: any) => material.dispose());
+            else child.material?.dispose();
+          });
+          weatherGroup.clear();
+          weatherMaterials.length = 0;
+          equipmentWarning = null;
+          // Weather covers the entire modeled water surface; equipment remains local.
+          const isEquipment = kind === "outage";
+          const waterMinX = -96.5;
+          const waterMaxX = 32.9;
+          const fieldWidth = isEquipment ? area.radius * 2 : waterMaxX - waterMinX;
+          const fieldDepth = isEquipment ? area.radius * 2 : 130;
+          weatherGroup.position.set(isEquipment ? area.x : (waterMinX + waterMaxX) / 2, 0, isEquipment ? area.z : 0);
+          weatherGroup.visible = active && strength > 0;
+          if (!weatherGroup.visible) return;
+          const intensity = Math.max(0, Math.min(1, strength));
+          const kindIndex = { wind: 0, storm: 1, fog: 2, outage: 3 }[kind];
+          const uniforms = {
+            uTime: { value: 0 },
+            uStrength: { value: intensity },
+            uPierZ: { value: [...PIER_Z] },
+            uKind: { value: kindIndex },
+            uColor: { value: new THREE.Color(kind === "outage" ? area.color : kind === "fog" ? "#9bb6c4" : "#6b9caa") },
+          };
+          // A single subtle surface layer keeps weather blended with the sea.
+          const fragmentShader = `
+            uniform float uTime;
+            uniform float uStrength;
+            uniform float uKind;
+            uniform vec3 uColor;
+            uniform float uPierZ[5];
+            varying vec2 vUv;
+            varying vec2 vWorldXZ;
+            float hash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+            float noise(vec2 p) {
+              vec2 i = floor(p), f = fract(p);
+              f = f * f * (3.0 - 2.0 * f);
+              return mix(mix(hash(i), hash(i + vec2(1., 0.)), f.x),
+                         mix(hash(i + vec2(0., 1.)), hash(i + vec2(1., 1.)), f.x), f.y);
+            }
+            float windStreak(vec2 p) {
+              vec2 flow = vec2(p.x + p.y * 0.35, p.y - p.x * 0.18);
+              float lane = floor(flow.y * 20.0);
+              float bend = sin(flow.x * 6.0 + lane) * 0.10;
+              float line = 1.0 - smoothstep(0.015, 0.11, abs(fract(flow.y * 20.0 + bend) - 0.5));
+              float streak = pow(max(0.0, sin(flow.x * 11.0 - uTime * 1.8 + lane * 2.4)), 5.0);
+              return line * streak;
+            }
+            void main() {
+              vec2 p = vUv * 2.0 - 1.0;
+              float edge = 1.0;
+              if (uKind > 2.5) {
+                float r = length(p);
+                if (r >= 1.0) discard;
+                edge = 1.0 - smoothstep(0.82, 1.0, r);
+              } else {
+                // Exclude the solid piers so the tint only touches water.
+                if (vWorldXZ.x >= 9.0) {
+                  for (int i = 0; i < 5; i++) {
+                    if (abs(vWorldXZ.y - uPierZ[i]) <= 2.55) discard;
+                  }
+                }
+              }
+              vec2 drift = vec2(uTime * 0.035, -uTime * 0.012);
+              float cloud = noise(p * 4.0 - drift) * 0.65
+                          + noise(p * 9.0 - drift * 1.7) * 0.35;
+              float alpha;
+              vec3 color = uColor;
+              if (uKind < 0.5) {
+                alpha = 0.045 * cloud + windStreak(p) * 0.65;
+              } else if (uKind < 2.5) {
+                // Both fog scenarios share the same drifting cloud pattern.
+                float fogDensity = smoothstep(0.22, 0.85, cloud);
+                if (uKind < 1.5) {
+                  // Dark charcoal fog stays beneath the ship hulls to preserve their visibility.
+                  color = mix(vec3(0.007), vec3(0.022), fogDensity);
+                  color = mix(color, vec3(0.065), windStreak(p) * 0.10);
+                  alpha = mix(0.82, 0.98, fogDensity);
+                } else {
+                  alpha = fogDensity * 0.36;
+                }
+              } else {
+                float hatch = 1.0 - smoothstep(0.04, 0.12, abs(fract((p.x + p.y) * 12.0) - 0.5));
+                alpha = 0.16 + hatch * 0.40;
+              }
+              float strength = uKind > 0.5 && uKind < 1.5 ? sqrt(uStrength) : uStrength;
+              gl_FragColor = vec4(color, alpha * edge * strength);
+              #include <tonemapping_fragment>
+              #include <colorspace_fragment>
+            }
+          `;
+          const material = new THREE.ShaderMaterial({
+            uniforms,
+            vertexShader: `
+              varying vec2 vUv;
+              varying vec2 vWorldXZ;
+              void main() {
+                vUv = uv;
+                vWorldXZ = (modelMatrix * vec4(position, 1.0)).xz;
+                gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+              }
+            `,
+            fragmentShader,
+            transparent: true,
+            depthWrite: false,
+            side: THREE.DoubleSide,
+          });
+          const field = new THREE.Mesh(new THREE.PlaneGeometry(fieldWidth, fieldDepth), material);
+          field.rotation.x = -Math.PI / 2;
+          field.position.y = isEquipment ? 1.1 : 0.15;
+          weatherGroup.add(field);
+          weatherMaterials.push(material);
+          if (kind === "outage") {
+            const { marker, warning } = makeWarningMarker(area.color);
+            weatherGroup.add(marker);
+            equipmentWarning = warning;
           }
-          const c = new THREE.Color(area.color);
-          const surface = new THREE.Mesh(new THREE.CircleGeometry(area.radius, 96), new THREE.MeshBasicMaterial({ color: c, transparent: true, opacity: isSimulated ? 0.155 : 0.082, side: THREE.DoubleSide, depthWrite: false }));
-          surface.rotation.x = -Math.PI / 2;
-          surface.position.set(area.x, 0.07, area.z);
-          weatherGroup.add(surface);
-          for (let k = 0; k < 3; k++) {
-            const size = area.radius * (1 - k * 0.23);
-            const ring = new THREE.Mesh(new THREE.RingGeometry(size - (k === 0 ? 0.48 : 0.18), size, 128), new THREE.MeshBasicMaterial({ color: c, transparent: true, opacity: isSimulated ? (0.78 - k * 0.19) : (0.40 - k * 0.1), side: THREE.DoubleSide, depthWrite: false }));
-            ring.rotation.x = -Math.PI / 2;
-            ring.position.set(area.x, 0.09 + k * 0.03, area.z);
-            weatherGroup.add(ring);
-          }
-          const center = new THREE.Mesh(new THREE.SphereGeometry(0.75, 16, 12), new THREE.MeshBasicMaterial({ color: c, transparent: true, opacity: 0.8 }));
-          center.position.set(area.x, 0.8, area.z);
-          weatherGroup.add(center);
         };
-        updateWeather(weather, simulated);
+        updateWeather(weather, weatherStrength, weatherActive, scenarioId);
 
         const applyCommand = (cmd: MapCommand) => {
           switch (cmd.kind) {
@@ -347,11 +518,9 @@ export default function PortMap3D({ selectedShip, onSelectShip, weather, simulat
         observer.observe(root);
         resize();
         const projected = new THREE.Vector3();
-        let frame = 0;
         let raf = 0;
         const animate = () => {
           raf = requestAnimationFrame(animate);
-          frame++;
           smoothRadius += (radius - smoothRadius) * 0.075;
           currentTarget.lerp(desiredTarget, 0.075);
           const horizontal = smoothRadius * Math.sin(polar);
@@ -360,12 +529,8 @@ export default function PortMap3D({ selectedShip, onSelectShip, weather, simulat
           camera.lookAt(currentTarget);
           for (let i = 0; i < vesselObjects.length; i++) {
             const vessel = vesselObjects[i];
-            const p = Math.min(0.975, vessel.baseProgress + Math.sin(frame * 0.0011 + i) * 0.0014);
-            const world = vessel.curve.getPointAt(p);
-            const tangent = vessel.curve.getTangentAt(p);
+            const world = point(THREE, ...vessel.ship.mapPosition, 0.68);
             vessel.mesh.position.copy(world);
-            vessel.mesh.position.y = 0.68 + Math.sin(frame * 0.025 + i * 2) * 0.075;
-            vessel.mesh.rotation.y = -Math.atan2(tangent.z, tangent.x);
             const label = labelElements[i];
             projected.copy(world); projected.y = 5.8; projected.project(camera);
             const w = root.clientWidth;
@@ -379,11 +544,17 @@ export default function PortMap3D({ selectedShip, onSelectShip, weather, simulat
           portLabel.style.left = `${(projected.x * 0.5 + 0.5) * root.clientWidth}px`;
           portLabel.style.top = `${(-projected.y * 0.5 + 0.5) * root.clientHeight}px`;
           portLabel.style.display = projected.z > 1 || Math.abs(projected.x) > 1.13 ? "none" : "flex";
+          if (equipmentWarning) equipmentWarning.quaternion.copy(camera.quaternion);
+          for (const { marker, warning } of unusedPierWarnings) {
+            if (marker.visible) warning.quaternion.copy(camera.quaternion);
+          }
+          const weatherTime = reduceMotion.matches ? 0 : performance.now() / 1000;
+          for (const material of weatherMaterials) material.uniforms.uTime.value = weatherTime;
           renderer.render(scene, camera);
         };
         animate();
 
-        apiRef.current = { command: applyCommand, setWeather: updateWeather, setSelected, destroy: () => {
+        apiRef.current = { setBerthCount, setVessels, command: applyCommand, setWeather: updateWeather, setSelected, destroy: () => {
           cancelAnimationFrame(raf);
           observer.disconnect();
           renderer.domElement.removeEventListener("pointerdown", onDown);
@@ -411,16 +582,20 @@ export default function PortMap3D({ selectedShip, onSelectShip, weather, simulat
   }, []);
 
   // Synchronize again when the asynchronous map initialization finishes.
-  useEffect(() => { if (ready) apiRef.current?.setWeather(weather, simulated); }, [ready, weather, simulated]);
-  useEffect(() => { if (ready) apiRef.current?.setSelected(selectedShip); }, [ready, selectedShip]);
+  useEffect(() => { if (ready) apiRef.current?.setBerthCount(berthCount); }, [ready, berthCount]);
+  useEffect(() => { if (ready) apiRef.current?.setWeather(weather, weatherStrength, weatherActive, scenarioId); }, [ready, weather, weatherStrength, weatherActive, scenarioId]);
+  useEffect(() => { if (ready) { apiRef.current?.setVessels(vessels); apiRef.current?.setSelected(selectedShip); } }, [ready, vessels, selectedShip]);
   useEffect(() => { if (ready && command) apiRef.current?.command(command); }, [ready, command]);
 
   return (
     <div className={`port-map-root ${compact ? "port-map-root--compact" : ""}`} ref={rootRef}>
       {!ready && !error && <div className="map-loading"><span className="map-loading__spinner"/><span>Initializing 3D maritime view…</span></div>}
-      {error && <div className="map-loading map-loading--error"><Icon name="alert" size={26}/><strong>3D view unavailable</strong><span>WebGL and a connection to the Three.js CDN are required.</span><button onClick={() => window.location.reload()}>Retry map</button></div>}
+      {error && <div className="map-loading map-loading--error"><Icon name="alert" size={26}/><strong>3D view unavailable</strong><span>The 3D view could not load. Check that WebGL is enabled in your browser.</span><button onClick={() => window.location.reload()}>Retry map</button></div>}
       {ready && <div className="map-controls-help"><Icon name="route" size={13}/> SCROLL TO ZOOM <span>·</span> DRAG TO PAN <span>·</span> SHIFT + DRAG TO ORBIT</div>}
-      {simulated && ready && <div className="map-sim-stamp">SCENARIO ACTIVE <span>·</span> {scenarioId === "outage" ? "TERMINAL IMPACT" : "WEATHER FOOTPRINT"}</div>}
+      {ready && <div className="map-weather-key" role="note">
+        <Icon name={scenarioId ?? "wind"} size={19}/>
+        <span>{scenarioId === "storm" ? "Storm conditions" : scenarioId === "fog" ? "Low visibility / fog" : scenarioId === "outage" ? weatherActive && weatherStrength > 0 ? "Equipment failure · berth closed" : "Equipment failure · repaired" : "Wind / gusts"}<small>{simulated ? weatherActive && weatherStrength > 0 ? scenarioId === "outage" ? "LOCAL BERTH CLOSURE" : "HARBOR-WIDE WEATHER" : "DISRUPTION INACTIVE" : "ILLUSTRATIVE CONDITIONS"}</small></span>
+      </div>}
     </div>
   );
 }

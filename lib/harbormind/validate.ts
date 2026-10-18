@@ -35,6 +35,15 @@ export function validateSimulationState(input: unknown): { state?: SimulationSta
     if (!stringList(raw.supportedHandling)) errors.push(`${path}.supportedHandling must be a string array.`);
     if (!validSource(raw.source)) errors.push(`${path}.source must be live, cached, or synthetic.`);
     if (!Array.isArray(raw.activeDisruptions) || raw.activeDisruptions.some((item) => !record(item) || !text(item.id) || !text(item.description) || !finite(item.severity) || item.severity < 0 || item.severity > 1 || !finite(item.startHour) || !Number.isInteger(item.startHour) || item.startHour < 0 || item.startHour > 720 || !finite(item.durationHours) || !Number.isInteger(item.durationHours) || item.durationHours < 0 || item.durationHours > 720)) errors.push(`${path}.activeDisruptions contains invalid data.`);
+    if (Array.isArray(raw.activeDisruptions)) for (const disruption of raw.activeDisruptions) {
+      if (!record(disruption) || disruption.closedBerthIds === undefined) continue;
+      const prefix = `${raw.portId}-berth-`;
+      if (!stringList(disruption.closedBerthIds) || disruption.closedBerthIds.some((id) => {
+        const number = Number(id.slice(prefix.length));
+        return !id.startsWith(prefix) || !Number.isInteger(number) || number < 1 || !finite(raw.availableBerths) || number > raw.availableBerths || id !== `${prefix}${number}`;
+      })) errors.push(`${path}.activeDisruptions has invalid closed berth IDs.`);
+    }
+
   }
 
   const shipIds = new Set<string>();

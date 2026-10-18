@@ -36,8 +36,8 @@ export type Scenario = {
 };
 
 export const SCENARIOS: Scenario[] = [
-  { id: "storm", label: "Coastal storm", kicker: "SEVERE WEATHER", description: "A fast-moving storm restricts unloading and creates a high-risk approach corridor.", impact: "60% terminal capacity loss", intensity: 60, zone: { x: -4, z: -13, radius: 24, color: "#e8a458" }, icon: "storm" },
-  { id: "fog", label: "Dense marine fog", kicker: "VISIBILITY EVENT", description: "Reduced visibility slows channel transit and forces longer vessel separation.", impact: "35% capacity loss", intensity: 35, zone: { x: -17, z: 6, radius: 27, color: "#93b4da" }, icon: "fog" },
-  { id: "wind", label: "Extreme crosswinds", kicker: "WIND ADVISORY", description: "Strong gusts suspend crane operations across exposed container terminals.", impact: "45% capacity loss", intensity: 45, zone: { x: 17, z: -7, radius: 19, color: "#e8a458" }, icon: "wind" },
-  { id: "outage", label: "Terminal equipment failure", kicker: "INFRASTRUCTURE", description: "A yard-crane and gate system failure reduces unloading and landside throughput.", impact: "50% capacity loss", intensity: 50, zone: { x: 30, z: 4, radius: 12, color: "#e4777a" }, icon: "outage" },
+  { id: "storm", label: "Coastal storm", kicker: "SEVERE WEATHER", description: "A fast-moving storm restricts unloading and creates a high-risk approach corridor.", impact: "60% terminal capacity loss", intensity: 60, zone: { x: -4, z: -13, radius: 43, color: "#e8a458" }, icon: "storm" },
+  { id: "fog", label: "Dense marine fog", kicker: "VISIBILITY EVENT", description: "Reduced visibility slows channel transit and forces longer vessel separation.", impact: "35% capacity loss", intensity: 35, zone: { x: -17, z: 6, radius: 42, color: "#93b4da" }, icon: "fog" },
+  { id: "wind", label: "Extreme crosswinds", kicker: "WIND ADVISORY", description: "Strong gusts suspend crane operations across exposed container terminals.", impact: "45% capacity loss", intensity: 45, zone: { x: 8, z: -7, radius: 38, color: "#e8a458" }, icon: "wind" },
+  { id: "outage", label: "Terminal equipment failure", kicker: "INFRASTRUCTURE", description: "A yard-crane and gate system failure reduces unloading and landside throughput.", impact: "50% capacity loss", intensity: 50, zone: { x: 23, z: -22, radius: 10, color: "#e4777a" }, icon: "outage" },
 ];

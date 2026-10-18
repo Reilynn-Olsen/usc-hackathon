@@ -13,6 +13,7 @@ export interface Cargo {
 }
 
 export interface PortDisruption {
+  closedBerthIds?: string[];
   id: string;
   description: string;
   severity: number;
@@ -35,6 +36,8 @@ export interface Port {
 }
 
 export interface Ship {
+  name?: string;
+  positionObservedAt?: string;
   vesselId: string;
   mmsi?: string;
   position: { latitude: number; longitude: number };
