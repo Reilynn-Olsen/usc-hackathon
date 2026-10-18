@@ -2,12 +2,14 @@
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { useEffect, useRef, useState } from "react";
-import { SHIPS, type Ship, type ScenarioId } from "../lib/data";
+import type { ScenarioId } from "../lib/data";
+import type { MapVessel } from "../lib/vessel-state";
 import { Icon } from "../lib/icons";
 
 export type MapCommand = { kind: "reset" | "zoomIn" | "zoomOut" | "focusShip" | "focusPort"; shipId?: string; nonce: number };
 type WeatherArea = { x: number; z: number; radius: number; color: string };
 type Props = {
+  vessels: MapVessel[];
   selectedShip: string;
   onSelectShip: (id: string) => void;
   weather: WeatherArea;
@@ -18,31 +20,20 @@ type Props = {
 };
 
 type MapApi = {
+  setVessels: (vessels: MapVessel[]) => void;
   command: (command: MapCommand) => void;
   setWeather: (weather: WeatherArea, simulated: boolean) => void;
   setSelected: (shipId: string) => void;
   destroy: () => void;
 };
 
-const CDNS = [
-  "https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.module.js",
-  "https://unpkg.com/three@0.180.0/build/three.module.js",
-];
-
-async function getThree(): Promise<any> {
-  // The browser imports Three.js directly so this drop-in only changes /app.
-  // To bundle locally later: npm install three, then replace this with import("three").
-  const browserImport = new Function("url", "return import(url)") as (url: string) => Promise<any>;
-  let lastError: unknown;
-  for (const url of CDNS) {
-    try { return await browserImport(url); } catch (error) { lastError = error; }
-  }
-  throw lastError;
+async function getThree() {
+  return import("three");
 }
 
 const point = (THREE: any, x: number, z: number, y = 1.4) => new THREE.Vector3(x, y, z);
 
-export default function PortMap3D({ selectedShip, onSelectShip, weather, simulated = false, scenarioId, command, compact = false }: Props) {
+export default function PortMap3D({ vessels, selectedShip, onSelectShip, weather, simulated = false, scenarioId, command, compact = false }: Props) {
   const rootRef = useRef<HTMLDivElement>(null);
   const apiRef = useRef<MapApi | null>(null);
 
@@ -163,22 +154,16 @@ export default function PortMap3D({ selectedShip, onSelectShip, weather, simulat
           scene.add(marker);
         }
 
-        const routeObjects: any[] = [];
-        const vesselObjects: { mesh: any; ship: Ship; curve: any; baseProgress: number; glow: any }[] = [];
+        const vesselObjects: { mesh: any; ship: MapVessel; track: any; glow: any }[] = [];
         const selectable: any[] = [];
         const labelElements: { element: HTMLButtonElement; point: any; id: string }[] = [];
         const labelsLayer = document.createElement("div");
         labelsLayer.className = "port-map-labels";
         root.appendChild(labelsLayer);
 
-        const addShip = (ship: Ship) => {
-          const route = new THREE.CatmullRomCurve3(ship.route.map(([x, z]) => point(THREE, x, z, 0.35)), false, "catmullrom", 0.5);
-          const pts = route.getPoints(110);
-          const routeGeometry = new THREE.BufferGeometry().setFromPoints(pts);
-          const track = new THREE.Line(routeGeometry, new THREE.LineDashedMaterial({ color: ship.priority === "Critical" ? "#5dd7ca" : "#50798e", dashSize: 1.4, gapSize: 0.85, transparent: true, opacity: ship.priority === "Critical" ? 0.95 : 0.75 }));
-          track.computeLineDistances();
+        const addShip = (ship: MapVessel) => {
+          const track = new THREE.Line(new THREE.BufferGeometry(), new THREE.LineDashedMaterial({ color: ship.color, dashSize: 1.4, gapSize: 0.85, transparent: true, opacity: 0.55 }));
           scene.add(track);
-          routeObjects.push(track);
           const group = new THREE.Group();
           group.userData.shipId = ship.id;
           const hull = new THREE.Mesh(new THREE.BoxGeometry(7.7, 1.42, 2.75), makeMat("#aac3c9", { metalness: 0.42, roughness: 0.44 }));
@@ -213,8 +198,8 @@ export default function PortMap3D({ selectedShip, onSelectShip, weather, simulat
           halo.position.y = 0.14;
           group.add(halo);
           scene.add(group);
-          group.traverse((child: any) => { if (child.isMesh) { child.userData.shipId = ship.id; selectable.push(child); } });
-          vesselObjects.push({ mesh: group, ship, curve: route, baseProgress: ship.progress, glow: halo });
+          group.traverse((child: any) => { if (child.isMesh) { child.userData.shipId = ship.id; } });
+          vesselObjects.push({ mesh: group, ship, track, glow: halo });
           const label = document.createElement("button");
           label.type = "button";
           label.className = "ship-map-label";
@@ -228,11 +213,47 @@ export default function PortMap3D({ selectedShip, onSelectShip, weather, simulat
           labelsLayer.appendChild(label);
           labelElements.push({ element: label, point: new THREE.Vector3(), id: ship.id });
         };
-        SHIPS.forEach(addShip);
+        const disposeObject = (object: any) => {
+          scene.remove(object);
+          object.traverse((child: any) => {
+            child.geometry?.dispose();
+            if (Array.isArray(child.material)) child.material.forEach((material: any) => material.dispose());
+            else child.material?.dispose();
+          });
+        };
+        const setVessels = (ships: MapVessel[]) => {
+          const ids = new Set(ships.map((ship) => ship.id));
+          for (let index = vesselObjects.length - 1; index >= 0; index--) {
+            const vessel = vesselObjects[index];
+            if (ids.has(vessel.ship.id)) continue;
+            disposeObject(vessel.mesh);
+            disposeObject(vessel.track);
+            labelElements[index].element.remove();
+            labelElements.splice(index, 1);
+            vesselObjects.splice(index, 1);
+          }
+          selectable.length = 0;
+          for (const ship of ships) {
+            let vessel = vesselObjects.find((item) => item.ship.id === ship.id);
+            if (!vessel) { addShip(ship); vessel = vesselObjects[vesselObjects.length - 1]; }
+            vessel.ship = ship;
+            vessel.mesh.position.set(ship.mapPosition[0], 0.68, ship.mapPosition[1]);
+            vessel.mesh.rotation.y = (ship.mapHeading - 90) * Math.PI / 180;
+            vessel.track.geometry.dispose();
+            vessel.track.geometry = new THREE.BufferGeometry().setFromPoints(ship.route.map(([x, z]) => point(THREE, x, z, 0.35)));
+            vessel.track.computeLineDistances();
+            vessel.track.visible = ship.route.some(([x, z]) => x !== ship.route[0][0] || z !== ship.route[0][1]);
+            vessel.mesh.traverse((child: any) => { if (child.isMesh) selectable.push(child); });
+            const label = labelElements.find((item) => item.id === ship.id)!;
+            label.element.title = `${ship.name} · ${ship.status} · ${ship.containers} containers`;
+            label.element.children[1].textContent = ship.name;
+          }
+        };
+        setVessels(vessels);
 
         const portLabel = document.createElement("div");
         portLabel.className = "map-port-label";
-        portLabel.innerHTML = `<span class="map-port-label__pin">✦</span><span>PORT OF LOS ANGELES<small>5 ACTIVE TERMINALS</small></span>`;
+        portLabel.innerHTML = `<span class="map-port-label__pin">✦</span><span>PORT OF LOS ANGELES<small>SCHEMATIC TERMINAL LAYOUT</small></span>`;
         labelsLayer.appendChild(portLabel);
 
         const weatherGroup = new THREE.Group();
@@ -241,8 +262,11 @@ export default function PortMap3D({ selectedShip, onSelectShip, weather, simulat
           while (weatherGroup.children.length) {
             const child = weatherGroup.children[0];
             weatherGroup.remove(child);
-            child.geometry?.dispose();
-            child.material?.dispose();
+            if (child instanceof THREE.Mesh) {
+              child.geometry.dispose();
+              if (Array.isArray(child.material)) child.material.forEach((material) => material.dispose());
+              else child.material.dispose();
+            }
           }
           const c = new THREE.Color(area.color);
           const surface = new THREE.Mesh(new THREE.CircleGeometry(area.radius, 96), new THREE.MeshBasicMaterial({ color: c, transparent: true, opacity: isSimulated ? 0.155 : 0.082, side: THREE.DoubleSide, depthWrite: false }));
@@ -347,11 +371,9 @@ export default function PortMap3D({ selectedShip, onSelectShip, weather, simulat
         observer.observe(root);
         resize();
         const projected = new THREE.Vector3();
-        let frame = 0;
         let raf = 0;
         const animate = () => {
           raf = requestAnimationFrame(animate);
-          frame++;
           smoothRadius += (radius - smoothRadius) * 0.075;
           currentTarget.lerp(desiredTarget, 0.075);
           const horizontal = smoothRadius * Math.sin(polar);
@@ -360,12 +382,8 @@ export default function PortMap3D({ selectedShip, onSelectShip, weather, simulat
           camera.lookAt(currentTarget);
           for (let i = 0; i < vesselObjects.length; i++) {
             const vessel = vesselObjects[i];
-            const p = Math.min(0.975, vessel.baseProgress + Math.sin(frame * 0.0011 + i) * 0.0014);
-            const world = vessel.curve.getPointAt(p);
-            const tangent = vessel.curve.getTangentAt(p);
+            const world = point(THREE, ...vessel.ship.mapPosition, 0.68);
             vessel.mesh.position.copy(world);
-            vessel.mesh.position.y = 0.68 + Math.sin(frame * 0.025 + i * 2) * 0.075;
-            vessel.mesh.rotation.y = -Math.atan2(tangent.z, tangent.x);
             const label = labelElements[i];
             projected.copy(world); projected.y = 5.8; projected.project(camera);
             const w = root.clientWidth;
@@ -383,7 +401,7 @@ export default function PortMap3D({ selectedShip, onSelectShip, weather, simulat
         };
         animate();
 
-        apiRef.current = { command: applyCommand, setWeather: updateWeather, setSelected, destroy: () => {
+        apiRef.current = { setVessels, command: applyCommand, setWeather: updateWeather, setSelected, destroy: () => {
           cancelAnimationFrame(raf);
           observer.disconnect();
           renderer.domElement.removeEventListener("pointerdown", onDown);
@@ -412,13 +430,13 @@ export default function PortMap3D({ selectedShip, onSelectShip, weather, simulat
 
   // Synchronize again when the asynchronous map initialization finishes.
   useEffect(() => { if (ready) apiRef.current?.setWeather(weather, simulated); }, [ready, weather, simulated]);
-  useEffect(() => { if (ready) apiRef.current?.setSelected(selectedShip); }, [ready, selectedShip]);
+  useEffect(() => { if (ready) { apiRef.current?.setVessels(vessels); apiRef.current?.setSelected(selectedShip); } }, [ready, vessels, selectedShip]);
   useEffect(() => { if (ready && command) apiRef.current?.command(command); }, [ready, command]);
 
   return (
     <div className={`port-map-root ${compact ? "port-map-root--compact" : ""}`} ref={rootRef}>
       {!ready && !error && <div className="map-loading"><span className="map-loading__spinner"/><span>Initializing 3D maritime view…</span></div>}
-      {error && <div className="map-loading map-loading--error"><Icon name="alert" size={26}/><strong>3D view unavailable</strong><span>WebGL and a connection to the Three.js CDN are required.</span><button onClick={() => window.location.reload()}>Retry map</button></div>}
+      {error && <div className="map-loading map-loading--error"><Icon name="alert" size={26}/><strong>3D view unavailable</strong><span>The 3D view could not load. Check that WebGL is enabled in your browser.</span><button onClick={() => window.location.reload()}>Retry map</button></div>}
       {ready && <div className="map-controls-help"><Icon name="route" size={13}/> SCROLL TO ZOOM <span>·</span> DRAG TO PAN <span>·</span> SHIFT + DRAG TO ORBIT</div>}
       {simulated && ready && <div className="map-sim-stamp">SCENARIO ACTIVE <span>·</span> {scenarioId === "outage" ? "TERMINAL IMPACT" : "WEATHER FOOTPRINT"}</div>}
     </div>

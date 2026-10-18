@@ -35,6 +35,8 @@ export interface Port {
 }
 
 export interface Ship {
+  name?: string;
+  positionObservedAt?: string;
   vesselId: string;
   mmsi?: string;
   position: { latitude: number; longitude: number };

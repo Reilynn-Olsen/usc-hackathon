@@ -26,6 +26,12 @@ export async function GET(request: Request) {
         }
       };
 
+      const abort = () => {
+        finish();
+        socket.close();
+      };
+      request.signal.addEventListener("abort", abort, { once: true });
+      if (request.signal.aborted) { abort(); return; }
       controller.enqueue(encoder.encode(": connected\n\n"));
       socket.addEventListener("open", () => {
         socket.send(JSON.stringify({
@@ -36,7 +42,14 @@ export async function GET(request: Request) {
       });
       socket.addEventListener("message", (event) => {
         try {
-          send("vessel", JSON.parse(String(event.data)));
+          const message = JSON.parse(String(event.data));
+          if (message && typeof message === "object" && ("error" in message || "Error" in message)) {
+            send("provider-error", { error: "AISStream rejected the subscription." });
+            finish();
+            socket.close();
+            return;
+          }
+          send("vessel", message);
         } catch {
           send("provider-error", { error: "AISStream sent an invalid message." });
         }
@@ -46,10 +59,7 @@ export async function GET(request: Request) {
         finish();
       });
       socket.addEventListener("close", finish);
-      request.signal.addEventListener("abort", () => {
-        closed = true;
-        socket.close();
-      }, { once: true });
+
     },
     cancel() {
       closed = true;
