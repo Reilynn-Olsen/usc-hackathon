@@ -11,6 +11,7 @@ export type MapCommand = { kind: "reset" | "zoomIn" | "zoomOut" | "focusShip" | 
 type WeatherArea = { x: number; z: number; radius: number; color: string };
 type Props = {
   vessels: MapVessel[];
+  berthCount?: number;
   selectedShip: string;
   onSelectShip: (id: string) => void;
   weather: WeatherArea;
@@ -23,6 +24,7 @@ type Props = {
 };
 
 type MapApi = {
+  setBerthCount: (count: number) => void;
   setVessels: (vessels: MapVessel[]) => void;
   command: (command: MapCommand) => void;
   setWeather: (weather: WeatherArea, strength: number, active: boolean, kind?: ScenarioId) => void;
@@ -36,7 +38,7 @@ async function getThree() {
 
 const point = (THREE: any, x: number, z: number, y = 1.4) => new THREE.Vector3(x, y, z);
 
-export default function PortMap3D({ vessels, selectedShip, onSelectShip, weather, simulated = false, weatherStrength = 0.45, weatherActive = true, scenarioId, command, compact = false }: Props) {
+export default function PortMap3D({ vessels, berthCount = PIER_Z.length, selectedShip, onSelectShip, weather, simulated = false, weatherStrength = 0.45, weatherActive = true, scenarioId, command, compact = false }: Props) {
   const rootRef = useRef<HTMLDivElement>(null);
   const apiRef = useRef<MapApi | null>(null);
 
@@ -156,6 +158,49 @@ export default function PortMap3D({ vessels, selectedShip, onSelectShip, weather
           marker.position.set(-65 + i * 13.5, 0.05, -58);
           scene.add(marker);
         }
+
+        const makeWarningMarker = (color: string) => {
+          const warning = new THREE.Group();
+          warning.position.y = 15;
+          const triangle = new THREE.Shape();
+          triangle.moveTo(0, 4.8);
+          triangle.lineTo(-5, -3.8);
+          triangle.lineTo(5, -3.8);
+          triangle.closePath();
+          warning.add(new THREE.Mesh(new THREE.ShapeGeometry(triangle), new THREE.MeshBasicMaterial({ color: "#512626", side: THREE.DoubleSide })));
+          const outline = new THREE.Line(new THREE.BufferGeometry().setFromPoints([
+            new THREE.Vector3(0, 4.8, 0.1), new THREE.Vector3(-5, -3.8, 0.1),
+            new THREE.Vector3(5, -3.8, 0.1), new THREE.Vector3(0, 4.8, 0.1),
+          ]), new THREE.LineBasicMaterial({ color: "#ffb878" }));
+          warning.add(outline);
+          const bar = new THREE.Mesh(new THREE.BoxGeometry(0.8, 3.5, 0.3), new THREE.MeshBasicMaterial({ color: "#ffd598" }));
+          bar.position.set(0, 0.5, 0.3);
+          warning.add(bar);
+          const dot = new THREE.Mesh(new THREE.SphereGeometry(0.46, 12, 8), new THREE.MeshBasicMaterial({ color: "#ffd598" }));
+          dot.position.set(0, -2.3, 0.3);
+          warning.add(dot);
+          const post = new THREE.Line(new THREE.BufferGeometry().setFromPoints([
+            new THREE.Vector3(0, 1.5, 0), new THREE.Vector3(0, 10.5, 0),
+          ]), new THREE.LineDashedMaterial({ color, dashSize: 0.7, gapSize: 0.5 }));
+          post.computeLineDistances();
+          const marker = new THREE.Group();
+          marker.add(post, warning);
+          return { marker, warning };
+        };
+
+        // Piers outside the modeled berth capacity stay visibly unavailable.
+        const unusedPierWarnings = PIER_Z.map((z) => {
+          const { marker, warning } = makeWarningMarker("#e4777a");
+          marker.position.set(23, 0, z);
+          scene.add(marker);
+          return { marker, warning };
+        });
+        const setBerthCount = (count: number) => {
+          for (const [index, { marker }] of unusedPierWarnings.entries()) {
+            marker.visible = index >= Math.max(0, count);
+          }
+        };
+        setBerthCount(berthCount);
 
         const vesselObjects: { mesh: any; ship: MapVessel; track: any; glow: any }[] = [];
         const selectable: any[] = [];
@@ -381,30 +426,8 @@ export default function PortMap3D({ vessels, selectedShip, onSelectShip, weather
           weatherGroup.add(field);
           weatherMaterials.push(material);
           if (kind === "outage") {
-            const warning = new THREE.Group();
-            warning.position.y = 15;
-            const triangle = new THREE.Shape();
-            triangle.moveTo(0, 4.8);
-            triangle.lineTo(-5, -3.8);
-            triangle.lineTo(5, -3.8);
-            triangle.closePath();
-            warning.add(new THREE.Mesh(new THREE.ShapeGeometry(triangle), new THREE.MeshBasicMaterial({ color: "#512626", side: THREE.DoubleSide })));
-            const outline = new THREE.Line(new THREE.BufferGeometry().setFromPoints([
-              new THREE.Vector3(0, 4.8, 0.1), new THREE.Vector3(-5, -3.8, 0.1),
-              new THREE.Vector3(5, -3.8, 0.1), new THREE.Vector3(0, 4.8, 0.1),
-            ]), new THREE.LineBasicMaterial({ color: "#ffb878" }));
-            warning.add(outline);
-            const bar = new THREE.Mesh(new THREE.BoxGeometry(0.8, 3.5, 0.3), new THREE.MeshBasicMaterial({ color: "#ffd598" }));
-            bar.position.set(0, 0.5, 0.3);
-            warning.add(bar);
-            const dot = new THREE.Mesh(new THREE.SphereGeometry(0.46, 12, 8), new THREE.MeshBasicMaterial({ color: "#ffd598" }));
-            dot.position.set(0, -2.3, 0.3);
-            warning.add(dot);
-            const post = new THREE.Line(new THREE.BufferGeometry().setFromPoints([
-              new THREE.Vector3(0, 1.5, 0), new THREE.Vector3(0, 10.5, 0),
-            ]), new THREE.LineDashedMaterial({ color: area.color, dashSize: 0.7, gapSize: 0.5 }));
-            post.computeLineDistances();
-            weatherGroup.add(post, warning);
+            const { marker, warning } = makeWarningMarker(area.color);
+            weatherGroup.add(marker);
             equipmentWarning = warning;
           }
         };
@@ -522,13 +545,16 @@ export default function PortMap3D({ vessels, selectedShip, onSelectShip, weather
           portLabel.style.top = `${(-projected.y * 0.5 + 0.5) * root.clientHeight}px`;
           portLabel.style.display = projected.z > 1 || Math.abs(projected.x) > 1.13 ? "none" : "flex";
           if (equipmentWarning) equipmentWarning.quaternion.copy(camera.quaternion);
+          for (const { marker, warning } of unusedPierWarnings) {
+            if (marker.visible) warning.quaternion.copy(camera.quaternion);
+          }
           const weatherTime = reduceMotion.matches ? 0 : performance.now() / 1000;
           for (const material of weatherMaterials) material.uniforms.uTime.value = weatherTime;
           renderer.render(scene, camera);
         };
         animate();
 
-        apiRef.current = { setVessels, command: applyCommand, setWeather: updateWeather, setSelected, destroy: () => {
+        apiRef.current = { setBerthCount, setVessels, command: applyCommand, setWeather: updateWeather, setSelected, destroy: () => {
           cancelAnimationFrame(raf);
           observer.disconnect();
           renderer.domElement.removeEventListener("pointerdown", onDown);
@@ -556,6 +582,7 @@ export default function PortMap3D({ vessels, selectedShip, onSelectShip, weather
   }, []);
 
   // Synchronize again when the asynchronous map initialization finishes.
+  useEffect(() => { if (ready) apiRef.current?.setBerthCount(berthCount); }, [ready, berthCount]);
   useEffect(() => { if (ready) apiRef.current?.setWeather(weather, weatherStrength, weatherActive, scenarioId); }, [ready, weather, weatherStrength, weatherActive, scenarioId]);
   useEffect(() => { if (ready) { apiRef.current?.setVessels(vessels); apiRef.current?.setSelected(selectedShip); } }, [ready, vessels, selectedShip]);
   useEffect(() => { if (ready && command) apiRef.current?.command(command); }, [ready, command]);
